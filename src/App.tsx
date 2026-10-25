@@ -1,0 +1,384 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect, useCallback } from 'react';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { LandingPage } from './components/LandingPage';
+import { WatchRoomPage, ClientRoomState } from './components/WatchRoomPage';
+import { CreateRoomModal, JoinRoomModal, InfoModal } from './components/Modals';
+import {
+  auth,
+  onAuthStateChanged,
+  signInWithGooglePopup,
+  signOutFirebase,
+  mirrorRoomCreationToFirestore,
+} from './lib/firebase';
+import { AlertCircle, X } from 'lucide-react';
+
+interface ActorSession {
+  id: string;
+  displayName: string;
+  avatarUrl: string;
+  authType: 'firebase' | 'guest';
+}
+
+const SESSION_TOKEN_KEY = 'friendsflix_session_token_v1';
+const SESSION_ACTOR_KEY = 'friendsflix_actor_v1';
+const ACTIVE_ROOM_ID_KEY = 'friendsflix_active_room_id_v1';
+
+export default function App() {
+  const [actor, setActor] = useState<ActorSession | null>(() => {
+    try {
+      const saved = sessionStorage.getItem(SESSION_ACTOR_KEY);
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [sessionToken, setSessionToken] = useState<string>(() => {
+    try {
+      return sessionStorage.getItem(SESSION_TOKEN_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
+
+  const [activeRoom, setActiveRoom] = useState<ClientRoomState | null>(null);
+  const [createdPendingRoom, setCreatedPendingRoom] = useState<ClientRoomState | null>(null);
+
+  // Dialog states
+  const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [joinModalOpen, setJoinModalOpen] = useState(false);
+  const [initialJoinCode, setInitialJoinCode] = useState('');
+  const [infoSection, setInfoSection] = useState<'architecture' | 'privacy' | 'terms' | 'contact' | null>(null);
+  const [globalNotice, setGlobalNotice] = useState<string | null>(null);
+  const [configStatus, setConfigStatus] = useState<any>(null);
+
+  // Helper to obtain or refresh a signed server session token
+  const ensureServerSession = useCallback(
+    async (params: {
+      displayName: string;
+      externalUid?: string;
+      authType?: 'firebase' | 'guest';
+      avatarUrl?: string;
+    }): Promise<{ actor: ActorSession; token: string }> => {
+      const resp = await fetch('/api/auth/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          displayName: params.displayName,
+          existingToken: sessionToken || undefined,
+          externalUid: params.externalUid,
+          authType: params.authType || actor?.authType || 'guest',
+          avatarUrl: params.avatarUrl ?? actor?.avatarUrl ?? '',
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.error || 'Could not initialize session.');
+      }
+
+      setActor(data.actor);
+      setSessionToken(data.token);
+      try {
+        sessionStorage.setItem(SESSION_ACTOR_KEY, JSON.stringify(data.actor));
+        sessionStorage.setItem(SESSION_TOKEN_KEY, data.token);
+      } catch {
+        // ignore storage errors
+      }
+      return { actor: data.actor, token: data.token };
+    },
+    [sessionToken, actor]
+  );
+
+  // 1. Load backend configuration status
+  useEffect(() => {
+    fetch('/api/config-status')
+      .then((r) => r.json())
+      .then((data) => setConfigStatus(data))
+      .catch(() => {});
+  }, []);
+
+  // 2. Listen for Firebase Auth state changes
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+      if (fbUser) {
+        const name = fbUser.displayName || fbUser.email?.split('@')[0] || 'Member';
+        try {
+          await ensureServerSession({
+            displayName: name,
+            externalUid: fbUser.uid,
+            authType: 'firebase',
+            avatarUrl: fbUser.photoURL || '',
+          });
+        } catch {
+          // ignore
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // 3. Check URL for invitation link (?room=...&code=...) or recover active room after refresh
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const roomParam = params.get('room');
+    const codeParam = params.get('code');
+
+    if (codeParam || roomParam) {
+      // If user already has a valid session and is a member of this room, try loading it directly
+      const savedToken = sessionStorage.getItem(SESSION_TOKEN_KEY);
+      if (savedToken && roomParam) {
+        fetch(`/api/rooms/${encodeURIComponent(roomParam)}`, {
+          headers: { Authorization: `Bearer ${savedToken}` },
+        })
+          .then(async (resp) => {
+            if (resp.ok) {
+              const data = await resp.json();
+              setActiveRoom(data.room);
+            } else {
+              setInitialJoinCode(window.location.href);
+              setJoinModalOpen(true);
+            }
+          })
+          .catch(() => {
+            setInitialJoinCode(window.location.href);
+            setJoinModalOpen(true);
+          });
+      } else {
+        setInitialJoinCode(codeParam || window.location.href);
+        setJoinModalOpen(true);
+      }
+      return;
+    }
+
+    // Otherwise check if user refreshed while inside an active room
+    const savedRoomId = sessionStorage.getItem(ACTIVE_ROOM_ID_KEY);
+    const savedToken = sessionStorage.getItem(SESSION_TOKEN_KEY);
+    if (savedRoomId && savedToken) {
+      fetch(`/api/rooms/${encodeURIComponent(savedRoomId)}`, {
+        headers: { Authorization: `Bearer ${savedToken}` },
+      })
+        .then(async (resp) => {
+          if (resp.ok) {
+            const data = await resp.json();
+            setActiveRoom(data.room);
+          } else {
+            sessionStorage.removeItem(ACTIVE_ROOM_ID_KEY);
+          }
+        })
+        .catch(() => {
+          sessionStorage.removeItem(ACTIVE_ROOM_ID_KEY);
+        });
+    }
+  }, []);
+
+  // Google Sign-In Handler
+  const handleGoogleSignIn = async () => {
+    try {
+      const fbUser = await signInWithGooglePopup();
+      const name = fbUser.displayName || fbUser.email?.split('@')[0] || 'Member';
+      await ensureServerSession({
+        displayName: name,
+        externalUid: fbUser.uid,
+        authType: 'firebase',
+        avatarUrl: fbUser.photoURL || '',
+      });
+    } catch (err: any) {
+      if (err?.code !== 'auth/popup-closed-by-user') {
+        setGlobalNotice(err?.message || 'Google Sign-In could not complete.');
+      }
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await signOutFirebase();
+    } catch {
+      // ignore
+    }
+    setActor(null);
+    setSessionToken('');
+    sessionStorage.removeItem(SESSION_ACTOR_KEY);
+    sessionStorage.removeItem(SESSION_TOKEN_KEY);
+    sessionStorage.removeItem(ACTIVE_ROOM_ID_KEY);
+  };
+
+  // Create Room Flow
+  const handleCreateRoom = async (params: {
+    roomName: string;
+    displayName: string;
+    isPrivate: boolean;
+    initialYoutubeId: string;
+    initialYoutubeTitle: string;
+  }) => {
+    const session = await ensureServerSession({
+      displayName: params.displayName,
+      externalUid: auth.currentUser?.uid,
+      authType: auth.currentUser ? 'firebase' : 'guest',
+      avatarUrl: auth.currentUser?.photoURL || '',
+    });
+
+    const resp = await fetch('/api/rooms', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${session.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: params.roomName,
+        isPrivate: params.isPrivate,
+        initialYoutubeId: params.initialYoutubeId,
+        initialYoutubeTitle: params.initialYoutubeTitle,
+      }),
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Failed to create room.');
+    }
+
+    const room: ClientRoomState = data.room;
+    setCreatedPendingRoom(room);
+
+    // Mirror room creation to Firestore if signed in with Google
+    mirrorRoomCreationToFirestore({
+      id: room.id,
+      name: room.name,
+      inviteCode: room.inviteCode,
+      isPrivate: room.isPrivate,
+      isLocked: room.isLocked,
+      activeMediaId: room.activeMediaId,
+      activeMediaType: room.activeMediaType,
+      activeMediaSource: room.activeMediaSource,
+      activeMediaTitle: room.activeMediaTitle,
+    }).catch(() => {});
+
+    return {
+      id: room.id,
+      inviteCode: room.inviteCode,
+      name: room.name,
+    };
+  };
+
+  const handleEnterCreatedRoom = () => {
+    if (!createdPendingRoom) return;
+    setActiveRoom(createdPendingRoom);
+    sessionStorage.setItem(ACTIVE_ROOM_ID_KEY, createdPendingRoom.id);
+    window.history.replaceState(
+      {},
+      '',
+      `/?room=${encodeURIComponent(createdPendingRoom.id)}&code=${encodeURIComponent(createdPendingRoom.inviteCode)}`
+    );
+    setCreatedPendingRoom(null);
+    setCreateModalOpen(false);
+  };
+
+  // Join Room Flow
+  const handleJoinRoom = async (params: { roomCodeOrLink: string; displayName: string }) => {
+    const session = await ensureServerSession({
+      displayName: params.displayName,
+      externalUid: auth.currentUser?.uid,
+      authType: auth.currentUser ? 'firebase' : 'guest',
+      avatarUrl: auth.currentUser?.photoURL || '',
+    });
+
+    const resp = await fetch('/api/rooms/join', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${session.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        roomCodeOrLink: params.roomCodeOrLink,
+      }),
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Could not join watch room.');
+    }
+
+    const room: ClientRoomState = data.room;
+    setActiveRoom(room);
+    sessionStorage.setItem(ACTIVE_ROOM_ID_KEY, room.id);
+    window.history.replaceState(
+      {},
+      '',
+      `/?room=${encodeURIComponent(room.id)}&code=${encodeURIComponent(room.inviteCode)}`
+    );
+    setJoinModalOpen(false);
+  };
+
+  const handleLeaveRoom = (reason?: string) => {
+    setActiveRoom(null);
+    sessionStorage.removeItem(ACTIVE_ROOM_ID_KEY);
+    window.history.replaceState({}, '', '/');
+    if (reason) {
+      setGlobalNotice(reason);
+    }
+  };
+
+  return (
+    <ErrorBoundary>
+      {globalNotice && (
+        <div className="fixed top-4 right-4 z-50 max-w-md bg-[#161626] border border-violet-500/40 rounded-xl p-4 shadow-2xl flex items-start justify-between gap-3 text-xs text-slate-200">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 text-violet-400 shrink-0 mt-0.5" />
+            <span className="leading-relaxed">{globalNotice}</span>
+          </div>
+          <button
+            onClick={() => setGlobalNotice(null)}
+            className="text-slate-400 hover:text-white shrink-0 cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {activeRoom && actor && sessionToken ? (
+        <WatchRoomPage
+          initialRoom={activeRoom}
+          actor={actor}
+          sessionToken={sessionToken}
+          onLeaveRoom={handleLeaveRoom}
+        />
+      ) : (
+        <LandingPage
+          onOpenCreateRoom={() => setCreateModalOpen(true)}
+          onOpenJoinRoom={() => setJoinModalOpen(true)}
+          onOpenInfoModal={(sec) => setInfoSection(sec)}
+          currentUser={actor}
+          onGoogleSignIn={handleGoogleSignIn}
+          onSignOut={handleSignOut}
+        />
+      )}
+
+      <CreateRoomModal
+        isOpen={createModalOpen}
+        onClose={() => setCreateModalOpen(false)}
+        defaultDisplayName={actor?.displayName || ''}
+        isAuthenticatedUser={Boolean(actor && actor.authType !== 'guest')}
+        onCreateRoom={handleCreateRoom}
+        onEnterCreatedRoom={handleEnterCreatedRoom}
+      />
+
+      <JoinRoomModal
+        isOpen={joinModalOpen}
+        onClose={() => setJoinModalOpen(false)}
+        initialCodeOrLink={initialJoinCode}
+        defaultDisplayName={actor?.displayName || ''}
+        onJoinRoom={handleJoinRoom}
+      />
+
+      <InfoModal
+        section={infoSection}
+        onClose={() => setInfoSection(null)}
+        configStatus={configStatus}
+      />
+    </ErrorBoundary>
+  );
+}

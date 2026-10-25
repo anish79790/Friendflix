@@ -1,0 +1,350 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Public user profile metadata stored without PII.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Authenticated user UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Public display name shown in watch rooms",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "avatarUrl": {
+          "type": "string",
+          "description": "Optional avatar URL or identifier",
+          "minLength": 0,
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update"
+        }
+      },
+      "required": ["uid", "displayName", "avatarUrl", "createdAt", "updatedAt"]
+    },
+    "Room": {
+      "title": "Room",
+      "description": "Synchronized watch party room state and metadata.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique room identifier",
+          "minLength": 6,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable room title",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "hostId": {
+          "type": "string",
+          "description": "UID of the current authoritative host",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inviteCode": {
+          "type": "string",
+          "description": "Random unguessable room invite code",
+          "minLength": 6,
+          "maxLength": 16,
+          "pattern": "^[A-Z0-9\\-]+$"
+        },
+        "isPrivate": {
+          "type": "boolean",
+          "description": "Whether invitation is required to join"
+        },
+        "isLocked": {
+          "type": "boolean",
+          "description": "Whether new members are blocked from joining"
+        },
+        "status": {
+          "type": "string",
+          "description": "Lifecycle status of the room",
+          "enum": ["active", "ended"],
+          "minLength": 5,
+          "maxLength": 10
+        },
+        "activeMediaId": {
+          "type": "string",
+          "description": "Currently loaded media item identifier",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "activeMediaType": {
+          "type": "string",
+          "description": "Type of active media source",
+          "enum": ["youtube", "upload", "none"],
+          "minLength": 4,
+          "maxLength": 10
+        },
+        "activeMediaSource": {
+          "type": "string",
+          "description": "YouTube video ID or protected upload path",
+          "minLength": 0,
+          "maxLength": 500
+        },
+        "activeMediaTitle": {
+          "type": "string",
+          "description": "Title of the currently playing media",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "playbackPosition": {
+          "type": "number",
+          "description": "Playback timestamp in seconds"
+        },
+        "isPlaying": {
+          "type": "boolean",
+          "description": "Whether the room player is actively playing"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last state mutation timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "hostId",
+        "inviteCode",
+        "isPrivate",
+        "isLocked",
+        "status",
+        "activeMediaId",
+        "activeMediaType",
+        "activeMediaSource",
+        "activeMediaTitle",
+        "playbackPosition",
+        "isPlaying",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "RoomMember": {
+      "title": "RoomMember",
+      "description": "Authorized participant membership record within a room.",
+      "type": "object",
+      "properties": {
+        "roomId": {
+          "type": "string",
+          "description": "Parent room ID",
+          "minLength": 6,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Participant user UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Participant display name",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "role": {
+          "type": "string",
+          "description": "Authorization role in the room",
+          "enum": ["host", "participant"],
+          "minLength": 4,
+          "maxLength": 15
+        },
+        "joinedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when member joined"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of last presence/role update"
+        }
+      },
+      "required": ["roomId", "userId", "displayName", "role", "joinedAt", "updatedAt"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "Persisted chat message within a watch party room.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Message ID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "roomId": {
+          "type": "string",
+          "description": "Parent room ID",
+          "minLength": 6,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "senderId": {
+          "type": "string",
+          "description": "Sender user UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Sender display name at send time",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "message": {
+          "type": "string",
+          "description": "Sanitized plain-text chat content",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Message creation timestamp"
+        }
+      },
+      "required": ["id", "roomId", "senderId", "displayName", "message", "createdAt"]
+    },
+    "QueueItem": {
+      "title": "QueueItem",
+      "description": "Shared video queue item inside a watch room.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Queue item ID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "roomId": {
+          "type": "string",
+          "description": "Parent room ID",
+          "minLength": 6,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "mediaItemId": {
+          "type": "string",
+          "description": "Associated media item ID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "sourceType": {
+          "type": "string",
+          "description": "Media source provider",
+          "enum": ["youtube", "upload"],
+          "minLength": 6,
+          "maxLength": 10
+        },
+        "sourceId": {
+          "type": "string",
+          "description": "YouTube 11-char ID or protected upload storage identifier",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "title": {
+          "type": "string",
+          "description": "Display title of the media item",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "position": {
+          "type": "number",
+          "description": "Zero-indexed queue ordering position"
+        },
+        "addedBy": {
+          "type": "string",
+          "description": "UID of the user who queued the item",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "addedByName": {
+          "type": "string",
+          "description": "Display name of the user who queued the item",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last reorder/update timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "roomId",
+        "mediaItemId",
+        "sourceType",
+        "sourceId",
+        "title",
+        "position",
+        "addedBy",
+        "addedByName",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Public user profiles keyed by UID without PII"
+    },
+    "/rooms/{roomId}": {
+      "schema": { "$ref": "#/entities/Room" },
+      "description": "Watch party rooms"
+    },
+    "/rooms/{roomId}/members/{memberId}": {
+      "schema": { "$ref": "#/entities/RoomMember" },
+      "description": "Room participants subcollection"
+    },
+    "/rooms/{roomId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "Room chat messages subcollection"
+    },
+    "/rooms/{roomId}/queue/{queueId}": {
+      "schema": { "$ref": "#/entities/QueueItem" },
+      "description": "Room shared playback queue subcollection"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "FriendsFlix",
+  "description": "Synchronized watch party web application with YouTube & private video uploads, WebRTC group voice chat, real-time messaging, and shared playback queues.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

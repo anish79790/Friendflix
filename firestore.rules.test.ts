@@ -1,0 +1,217 @@
+/**
+ * Firestore Security Rules Test Suite — Verifies the "Dirty Dozen" adversarial payloads
+ * against FriendsFlix ABAC and Zero-Trust Firestore rules.
+ */
+
+export interface DirtyDozenTestCase {
+  id: number;
+  name: string;
+  collectionPath: string;
+  operation: 'get' | 'list' | 'create' | 'update' | 'delete';
+  authUid: string | null;
+  emailVerified: boolean;
+  payload?: Record<string, unknown>;
+  expectedResult: 'PERMISSION_DENIED';
+}
+
+export const DIRTY_DOZEN_TEST_CASES: DirtyDozenTestCase[] = [
+  {
+    id: 1,
+    name: 'Identity Spoofing on Room Create',
+    collectionPath: '/rooms/room_01',
+    operation: 'create',
+    authUid: 'user_attacker',
+    emailVerified: true,
+    payload: {
+      id: 'room_01',
+      name: 'Movie Night',
+      hostId: 'user_victim',
+      inviteCode: 'FFX12345',
+      isPrivate: true,
+      isLocked: false,
+      status: 'active',
+      activeMediaId: '',
+      activeMediaType: 'none',
+      activeMediaSource: '',
+      activeMediaTitle: '',
+      playbackPosition: 0,
+      isPlaying: false,
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 2,
+    name: 'Unverified Email Write',
+    collectionPath: '/users/user_unverified',
+    operation: 'create',
+    authUid: 'user_unverified',
+    emailVerified: false,
+    payload: {
+      uid: 'user_unverified',
+      displayName: 'Unverified User',
+      avatarUrl: '',
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 3,
+    name: 'Shadow Field Injection on Room Update',
+    collectionPath: '/rooms/room_01',
+    operation: 'update',
+    authUid: 'user_host',
+    emailVerified: true,
+    payload: {
+      name: 'Updated Room',
+      isSuperRoom: true,
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 4,
+    name: 'Orphaned Room Creation without Host Membership',
+    collectionPath: '/rooms/room_orphan',
+    operation: 'create',
+    authUid: 'user_host',
+    emailVerified: true,
+    payload: {
+      id: 'room_orphan',
+      name: 'Orphan Room',
+      hostId: 'user_host',
+      inviteCode: 'ORPH1234',
+      isPrivate: true,
+      isLocked: false,
+      status: 'active',
+      activeMediaId: '',
+      activeMediaType: 'none',
+      activeMediaSource: '',
+      activeMediaTitle: '',
+      playbackPosition: 0,
+      isPlaying: false,
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 5,
+    name: 'Privilege Escalation in RoomMember',
+    collectionPath: '/rooms/room_01/members/user_guest',
+    operation: 'create',
+    authUid: 'user_guest',
+    emailVerified: true,
+    payload: {
+      roomId: 'room_01',
+      userId: 'user_guest',
+      displayName: 'Guest',
+      role: 'host',
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 6,
+    name: 'Locked Room Bypass',
+    collectionPath: '/rooms/room_locked/members/user_intruder',
+    operation: 'create',
+    authUid: 'user_intruder',
+    emailVerified: true,
+    payload: {
+      roomId: 'room_locked',
+      userId: 'user_intruder',
+      displayName: 'Intruder',
+      role: 'participant',
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 7,
+    name: 'Terminal State Mutation on Ended Room',
+    collectionPath: '/rooms/room_ended',
+    operation: 'update',
+    authUid: 'user_host',
+    emailVerified: true,
+    payload: {
+      playbackPosition: 120,
+      isPlaying: true,
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 8,
+    name: 'Non-Member Chat Injection',
+    collectionPath: '/rooms/room_01/messages/msg_01',
+    operation: 'create',
+    authUid: 'user_outsider',
+    emailVerified: true,
+    payload: {
+      id: 'msg_01',
+      roomId: 'room_01',
+      senderId: 'user_outsider',
+      displayName: 'Outsider',
+      message: 'Hello from outside',
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 9,
+    name: 'Denial-of-Wallet Oversized Chat Message',
+    collectionPath: '/rooms/room_01/messages/msg_oversized',
+    operation: 'create',
+    authUid: 'user_member',
+    emailVerified: true,
+    payload: {
+      id: 'msg_oversized',
+      roomId: 'room_01',
+      senderId: 'user_member',
+      displayName: 'Member',
+      message: 'A'.repeat(2000),
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 10,
+    name: 'Unauthorized Queue Manipulation by Non-Host',
+    collectionPath: '/rooms/room_01/queue/q_01',
+    operation: 'create',
+    authUid: 'user_participant',
+    emailVerified: true,
+    payload: {
+      id: 'q_01',
+      roomId: 'room_01',
+      mediaItemId: 'media_01',
+      sourceType: 'youtube',
+      sourceId: 'dQw4w9WgXcQ',
+      title: 'Test Video',
+      position: 0,
+      addedBy: 'user_participant',
+      addedByName: 'Participant',
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 11,
+    name: 'Timestamp Forgery on Message Create',
+    collectionPath: '/rooms/room_01/messages/msg_forged',
+    operation: 'create',
+    authUid: 'user_member',
+    emailVerified: true,
+    payload: {
+      id: 'msg_forged',
+      roomId: 'room_01',
+      senderId: 'user_member',
+      displayName: 'Member',
+      message: 'Backdated message',
+      createdAt: '2020-01-01T00:00:00Z',
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 12,
+    name: 'Immutable Field Tampering on Room Update',
+    collectionPath: '/rooms/room_01',
+    operation: 'update',
+    authUid: 'user_host',
+    emailVerified: true,
+    payload: {
+      inviteCode: 'HACKED99',
+    },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+];
