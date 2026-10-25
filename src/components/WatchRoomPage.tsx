@@ -29,12 +29,24 @@ import {
   Youtube,
   Smile,
   Volume2,
+  KeyRound,
+  UserCheck,
+  X,
+  Share2,
 } from 'lucide-react';
 import { BrandLogo } from './BrandLogo';
 import { VideoStage, PlaybackStateSnapshot } from './VideoStage';
 import { AddMediaModal } from './Modals';
 import { WebRTCMeshManager, PeerConnectionStatus, IncomingSignal } from '../lib/webrtc';
 import { mirrorChatMessageToFirestore, mirrorRoomPlaybackToFirestore } from '../lib/firebase';
+import {
+  JoinRequestItem,
+  safeJsonFetch,
+  updateFallbackRoom,
+  respondFallbackJoinRequest,
+  subscribeLocalRoomEvents,
+  broadcastLocalRoomEvent,
+} from '../lib/roomEngine';
 
 export interface ClientMember {
   memberId: string;
@@ -108,6 +120,7 @@ export interface ClientRoomState {
   createdAt: string;
   expiresAt: number;
   members: ClientMember[];
+  joinRequests?: JoinRequestItem[];
   mediaItems: ClientMediaItem[];
   queue: ClientQueueItem[];
   messages: ClientChatMessage[];
@@ -137,7 +150,8 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
 }) => {
   const [room, setRoom] = useState<ClientRoomState>(initialRoom);
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
-  const [copiedInvite, setCopiedInvite] = useState(false);
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedInviteLink, setCopiedInviteLink] = useState(false);
   const [bottomDeckTab, setBottomDeckTab] = useState<'queue' | 'uploads' | 'members' | 'settings'>('queue');
 
   // Add Media Modal State
@@ -170,15 +184,57 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
   const reconnectTimerRef = useRef<number | null>(null);
   const unmountedRef = useRef<boolean>(false);
   const webrtcRef = useRef<WebRTCMeshManager | null>(null);
+  const isFallbackModeRef = useRef<boolean>(sessionToken.startsWith('local_'));
 
   const isHost = room.hostId === actor.id;
+  const pendingJoinRequests = room.joinRequests || [];
 
-  // Send JSON payload over WebSocket
-  const sendWsMessage = useCallback((payload: Record<string, unknown>) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
-    }
-  }, []);
+  // Send JSON payload over WebSocket (or BroadcastChannel in static fallback mode)
+  const sendWsMessage = useCallback(
+    (payload: Record<string, unknown>) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(payload));
+      } else if (isFallbackModeRef.current) {
+        broadcastLocalRoomEvent({
+          ...payload,
+          roomId: room.id,
+          senderActorId: actor.id,
+        });
+      }
+    },
+    [room.id, actor.id]
+  );
+
+  // Subscribe to Local/BroadcastChannel Events (supports static deployments like Vercel + multi-tab sync)
+  useEffect(() => {
+    const unsubscribe = subscribeLocalRoomEvents((data) => {
+      if (!data) return;
+      if (data.type === 'local:rooms_updated' && data.roomsMap && data.roomsMap[room.id]) {
+        setRoom(data.roomsMap[room.id]);
+        return;
+      }
+      if (data.roomId !== room.id) return;
+
+      if (data.type === 'room:updated' && data.room) {
+        setRoom(data.room);
+      } else if (data.type === 'room:join_request' && data.room) {
+        setRoom(data.room);
+      } else if (data.type === 'room:join_request_responded' && data.room) {
+        setRoom(data.room);
+      } else if (data.type === 'chat:typing' && data.senderActorId !== actor.id) {
+        setTypingUsers((prev) => {
+          const next = { ...prev };
+          if (data.isTyping) {
+            next[data.senderActorId] = data.displayName || 'Friend';
+          } else {
+            delete next[data.senderActorId];
+          }
+          return next;
+        });
+      }
+    });
+    return () => unsubscribe();
+  }, [room.id, actor.id]);
 
   // Initialize WebRTC Manager
   useEffect(() => {
@@ -226,9 +282,17 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
     webrtcRef.current.syncVoicePeers(activeVoiceIds);
   }, [inVoice, room.members]);
 
-  // Connect WebSocket
+  // Connect WebSocket (with graceful fallback if running on static host without /ws)
   useEffect(() => {
     unmountedRef.current = false;
+
+    if (sessionToken.startsWith('local_')) {
+      isFallbackModeRef.current = true;
+      setConnectionState('connected');
+      return;
+    }
+
+    let wsOpenedAtLeastOnce = false;
 
     const connectWebSocket = (isReconnect = false) => {
       if (unmountedRef.current) return;
@@ -239,11 +303,20 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
         initialRoom.id
       )}&token=${encodeURIComponent(sessionToken)}`;
 
-      const ws = new WebSocket(wsUrl);
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch {
+        isFallbackModeRef.current = true;
+        setConnectionState('connected');
+        return;
+      }
       wsRef.current = ws;
 
       ws.onopen = () => {
         if (unmountedRef.current) return;
+        wsOpenedAtLeastOnce = true;
+        isFallbackModeRef.current = false;
         setConnectionState('connected');
         ws.send(JSON.stringify({ type: 'playback:request_sync' }));
       };
@@ -290,6 +363,14 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
             break;
           }
 
+          case 'room:join_requests_updated': {
+            setRoom((prev) => ({
+              ...prev,
+              joinRequests: Array.isArray(data.joinRequests) ? data.joinRequests : prev.joinRequests,
+            }));
+            break;
+          }
+
           case 'member:joined': {
             setRoom((prev) => {
               const nextMessages =
@@ -299,6 +380,7 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
               return {
                 ...prev,
                 members: Array.isArray(data.members) ? data.members : prev.members,
+                joinRequests: Array.isArray(data.joinRequests) ? data.joinRequests : prev.joinRequests,
                 messages: nextMessages,
               };
             });
@@ -461,6 +543,12 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
           onLeaveRoom(ev.reason || 'Session disconnected.');
           return;
         }
+        if (!wsOpenedAtLeastOnce) {
+          // Static host (e.g. Vercel) where /ws does not exist — switch cleanly to fallback mode
+          isFallbackModeRef.current = true;
+          setConnectionState('connected');
+          return;
+        }
         setConnectionState('reconnecting');
         reconnectTimerRef.current = window.setTimeout(() => {
           connectWebSocket(true);
@@ -492,14 +580,59 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
     }
   }, [room.messages.length]);
 
-  // Copy Invite Link
-  const handleCopyInvite = async () => {
+  // Copy Unique Room Code Only
+  const handleCopyCodeOnly = async () => {
+    await navigator.clipboard.writeText(room.inviteCode);
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  // Copy Full Invite Share Link
+  const handleCopyInviteLink = async () => {
     const url = `${window.location.origin}/?room=${encodeURIComponent(room.id)}&code=${encodeURIComponent(
       room.inviteCode
     )}`;
     await navigator.clipboard.writeText(url);
-    setCopiedInvite(true);
-    setTimeout(() => setCopiedInvite(false), 2000);
+    setCopiedInviteLink(true);
+    setTimeout(() => setCopiedInviteLink(false), 2000);
+  };
+
+  // Host Approve or Reject Private Room Join Request
+  const handleRespondToJoinRequest = async (targetMemberId: string, action: 'approve' | 'reject') => {
+    if (!isHost) return;
+
+    const res = await safeJsonFetch<{ room: ClientRoomState }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/join-requests/${encodeURIComponent(targetMemberId)}/respond`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action }),
+      }
+    );
+
+    if (res.isServerUnavailable) {
+      const updated = respondFallbackJoinRequest({
+        roomId: room.id,
+        hostId: actor.id,
+        targetMemberId,
+        action,
+      });
+      if (updated) setRoom(updated);
+      return;
+    }
+
+    if (!res.ok) {
+      setActionBanner(res.error || 'Could not process join request.');
+      setTimeout(() => setActionBanner(null), 3500);
+      return;
+    }
+
+    if (res.data?.room) {
+      setRoom(res.data.room);
+    }
   };
 
   // Host Broadcast Playback State
@@ -507,7 +640,7 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
     (nextState: Partial<PlaybackStateSnapshot>) => {
       if (!isHost) return;
       setRoom((prev) => {
-        const merged = {
+        const merged: ClientRoomState = {
           ...prev,
           activeMediaId: nextState.activeMediaId ?? prev.activeMediaId,
           activeMediaType: nextState.activeMediaType ?? prev.activeMediaType,
@@ -530,6 +663,10 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
           playbackPosition: merged.playbackPosition,
           isPlaying: merged.isPlaying,
         });
+
+        if (isFallbackModeRef.current) {
+          updateFallbackRoom(merged.id, () => merged);
+        }
 
         mirrorRoomPlaybackToFirestore({
           roomId: merged.id,
@@ -569,6 +706,16 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
         type: 'voice:join',
         isMuted: false,
       });
+
+      if (isFallbackModeRef.current) {
+        const updated = updateFallbackRoom(room.id, (r) => ({
+          ...r,
+          members: r.members.map((m) =>
+            m.memberId === actor.id ? { ...m, inVoice: true, isMuted: false } : m
+          ),
+        }));
+        if (updated) setRoom(updated);
+      }
     } catch (err: any) {
       const msg =
         err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError'
@@ -587,6 +734,16 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
     setLocalSpeaking(false);
     setLocalAudioLevel(0);
     sendWsMessage({ type: 'voice:leave' });
+
+    if (isFallbackModeRef.current) {
+      const updated = updateFallbackRoom(room.id, (r) => ({
+        ...r,
+        members: r.members.map((m) =>
+          m.memberId === actor.id ? { ...m, inVoice: false, isMuted: false, isSpeaking: false } : m
+        ),
+      }));
+      if (updated) setRoom(updated);
+    }
   };
 
   const handleToggleVoiceMute = () => {
@@ -614,10 +771,14 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
   // Chat Actions
   const handleChatInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setChatInput(e.target.value);
-    sendWsMessage({ type: 'chat:typing', isTyping: e.target.value.trim().length > 0 });
+    sendWsMessage({
+      type: 'chat:typing',
+      displayName: actor.displayName,
+      isTyping: e.target.value.trim().length > 0,
+    });
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     typingTimeoutRef.current = window.setTimeout(() => {
-      sendWsMessage({ type: 'chat:typing', isTyping: false });
+      sendWsMessage({ type: 'chat:typing', displayName: actor.displayName, isTyping: false });
     }, 2000);
   };
 
@@ -631,11 +792,31 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
     }
 
     const clientId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    sendWsMessage({
-      type: 'chat:send',
-      clientId,
-      message: trimmed,
-    });
+
+    if (isFallbackModeRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      const newMsg: ClientChatMessage = {
+        id: clientId,
+        roomId: room.id,
+        senderId: actor.id,
+        displayName: actor.displayName,
+        avatarUrl: actor.avatarUrl,
+        message: trimmed,
+        reactions: {},
+        createdAt: new Date().toISOString(),
+      };
+      setRoom((prev) => {
+        const next = { ...prev, messages: [...prev.messages, newMsg] };
+        updateFallbackRoom(room.id, () => next);
+        return next;
+      });
+    } else {
+      sendWsMessage({
+        type: 'chat:send',
+        clientId,
+        message: trimmed,
+      });
+    }
+
     sendWsMessage({ type: 'chat:typing', isTyping: false });
 
     mirrorChatMessageToFirestore({
@@ -649,79 +830,190 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
   };
 
   const handleToggleReaction = (messageId: string, emoji: string) => {
-    sendWsMessage({
-      type: 'chat:reaction',
-      messageId,
-      emoji,
-    });
+    if (isFallbackModeRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setRoom((prev) => {
+        const nextMessages = prev.messages.map((m) => {
+          if (m.id !== messageId) return m;
+          const existing = m.reactions[emoji] || [];
+          const nextReactors = existing.includes(actor.id)
+            ? existing.filter((id) => id !== actor.id)
+            : [...existing, actor.id];
+          const nextReactions = { ...m.reactions };
+          if (nextReactors.length === 0) delete nextReactions[emoji];
+          else nextReactions[emoji] = nextReactors;
+          return { ...m, reactions: nextReactions };
+        });
+        const next = { ...prev, messages: nextMessages };
+        updateFallbackRoom(room.id, () => next);
+        return next;
+      });
+    } else {
+      sendWsMessage({
+        type: 'chat:reaction',
+        messageId,
+        emoji,
+      });
+    }
     setActiveReactionPickerId(null);
   };
 
-  // Queue & Media API Actions
+  // Queue & Media API Actions (with automatic static-host fallback)
   const handleAddYoutubeToQueue = async (params: {
     videoId: string;
     title: string;
     playImmediately: boolean;
   }) => {
-    const resp = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/queue`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${sessionToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
+    const res = await safeJsonFetch<{ room: ClientRoomState }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/queue`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sourceType: 'youtube',
+          sourceId: params.videoId,
+          title: params.title,
+          playImmediately: params.playImmediately,
+        }),
+      }
+    );
+
+    if (res.isServerUnavailable) {
+      const nowIso = new Date().toISOString();
+      const mediaId = `med_${Math.random().toString(36).slice(2, 10)}`;
+      const queueItem: ClientQueueItem = {
+        id: `q_${Math.random().toString(36).slice(2, 10)}`,
+        roomId: room.id,
+        mediaItemId: mediaId,
         sourceType: 'youtube',
         sourceId: params.videoId,
         title: params.title,
-        playImmediately: params.playImmediately,
-      }),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      throw new Error(data.error || 'Failed to add video to queue.');
+        position: room.queue.length,
+        addedBy: actor.id,
+        addedByName: actor.displayName,
+        createdAt: nowIso,
+      };
+      const shouldPlayNow = (params.playImmediately && isHost) || room.activeMediaType === 'none';
+
+      setRoom((prev) => {
+        const next: ClientRoomState = {
+          ...prev,
+          queue: [...prev.queue, queueItem],
+          activeMediaId: shouldPlayNow ? mediaId : prev.activeMediaId,
+          activeMediaType: shouldPlayNow ? 'youtube' : prev.activeMediaType,
+          activeMediaSource: shouldPlayNow ? params.videoId : prev.activeMediaSource,
+          activeMediaTitle: shouldPlayNow ? params.title : prev.activeMediaTitle,
+          playbackPosition: shouldPlayNow ? 0 : prev.playbackPosition,
+          isPlaying: shouldPlayNow ? true : prev.isPlaying,
+          playbackUpdatedAt: Date.now(),
+        };
+        updateFallbackRoom(room.id, () => next);
+        return next;
+      });
+      return;
     }
-    if (data.room) setRoom(data.room);
+
+    if (!res.ok) {
+      throw new Error(res.error || 'Failed to add video to queue.');
+    }
+    if (res.data?.room) setRoom(res.data.room);
   };
 
   const handleQueueAction = async (
     action: 'select' | 'play-next' | 'reorder',
     payload?: { queueId?: string; orderedIds?: string[] }
   ) => {
-    try {
-      const resp = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/queue`, {
+    const res = await safeJsonFetch<{ room: ClientRoomState }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/queue`,
+      {
         method: 'PATCH',
         headers: {
           Authorization: `Bearer ${sessionToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ action, ...payload }),
+      }
+    );
+
+    if (res.isServerUnavailable) {
+      setRoom((prev) => {
+        let next = { ...prev };
+        if (action === 'select' && payload?.queueId) {
+          const target = prev.queue.find((q) => q.id === payload.queueId);
+          if (target) {
+            next = {
+              ...next,
+              activeMediaId: target.mediaItemId,
+              activeMediaType: target.sourceType,
+              activeMediaSource: target.sourceId,
+              activeMediaTitle: target.title,
+              playbackPosition: 0,
+              isPlaying: true,
+              playbackUpdatedAt: Date.now(),
+            };
+          }
+        } else if (action === 'play-next' && prev.queue.length > 0) {
+          const idx = prev.queue.findIndex((q) => q.mediaItemId === prev.activeMediaId);
+          const nextItem = idx >= 0 && idx + 1 < prev.queue.length ? prev.queue[idx + 1] : prev.queue[0];
+          if (nextItem) {
+            next = {
+              ...next,
+              activeMediaId: nextItem.mediaItemId,
+              activeMediaType: nextItem.sourceType,
+              activeMediaSource: nextItem.sourceId,
+              activeMediaTitle: nextItem.title,
+              playbackPosition: 0,
+              isPlaying: true,
+              playbackUpdatedAt: Date.now(),
+            };
+          }
+        }
+        updateFallbackRoom(room.id, () => next);
+        return next;
       });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || 'Queue update failed.');
-      if (data.room) setRoom(data.room);
-    } catch (err: any) {
-      setActionBanner(err?.message || 'Could not update queue.');
-      setTimeout(() => setActionBanner(null), 3500);
+      return;
     }
+
+    if (!res.ok) {
+      setActionBanner(res.error || 'Queue update failed.');
+      setTimeout(() => setActionBanner(null), 3500);
+      return;
+    }
+    if (res.data?.room) setRoom(res.data.room);
   };
 
   const handleRemoveQueueItem = async (queueId: string) => {
-    try {
-      const resp = await fetch(
-        `/api/rooms/${encodeURIComponent(room.id)}/queue/${encodeURIComponent(queueId)}`,
-        {
-          method: 'DELETE',
-          headers: { Authorization: `Bearer ${sessionToken}` },
-        }
-      );
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || 'Failed to remove item.');
-      if (Array.isArray(data.queue)) {
-        setRoom((prev) => ({ ...prev, queue: data.queue }));
+    const res = await safeJsonFetch<{ queue: ClientQueueItem[] }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/queue/${encodeURIComponent(queueId)}`,
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionToken}` },
       }
-    } catch (err: any) {
-      setActionBanner(err?.message || 'Failed to remove queue item.');
+    );
+
+    if (res.isServerUnavailable) {
+      setRoom((prev) => {
+        const next = {
+          ...prev,
+          queue: prev.queue
+            .filter((q) => q.id !== queueId)
+            .map((item, idx) => ({ ...item, position: idx })),
+        };
+        updateFallbackRoom(room.id, () => next);
+        return next;
+      });
+      return;
+    }
+
+    if (!res.ok) {
+      setActionBanner(res.error || 'Failed to remove queue item.');
       setTimeout(() => setActionBanner(null), 3500);
+      return;
+    }
+    if (Array.isArray(res.data?.queue)) {
+      setRoom((prev) => ({ ...prev, queue: res.data!.queue }));
     }
   };
 
@@ -735,30 +1027,29 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
   };
 
   const handleDeleteUploadedMedia = async (mediaId: string) => {
-    try {
-      const resp = await fetch(
-        `/api/rooms/${encodeURIComponent(room.id)}/media/${encodeURIComponent(mediaId)}`,
-        {
-          method: 'DELETE',
-          headers: { Authorization: `Bearer ${sessionToken}` },
-        }
-      );
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || 'Could not delete uploaded video.');
-      setRoom((prev) => ({
-        ...prev,
-        mediaItems: prev.mediaItems.filter((m) => m.id !== data.deletedId),
-        queue: prev.queue.filter((q) => q.mediaItemId !== data.deletedId),
-      }));
-    } catch (err: any) {
-      setActionBanner(err?.message || 'Failed to delete video.');
+    const res = await safeJsonFetch<{ deletedId: string }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/media/${encodeURIComponent(mediaId)}`,
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionToken}` },
+      }
+    );
+    if (!res.ok) {
+      setActionBanner(res.error || 'Failed to delete video.');
       setTimeout(() => setActionBanner(null), 3500);
+      return;
     }
+    setRoom((prev) => ({
+      ...prev,
+      mediaItems: prev.mediaItems.filter((m) => m.id !== res.data?.deletedId),
+      queue: prev.queue.filter((q) => q.mediaItemId !== res.data?.deletedId),
+    }));
   };
 
   const handleQueueUploadedMedia = async (mediaItem: ClientMediaItem, playImmediately: boolean) => {
-    try {
-      const resp = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/queue`, {
+    const res = await safeJsonFetch<{ room: ClientRoomState }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/queue`,
+      {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${sessionToken}`,
@@ -770,15 +1061,15 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
           title: mediaItem.title,
           playImmediately,
         }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || 'Could not queue uploaded file.');
-      if (data.room) setRoom(data.room);
-      setBottomDeckTab('queue');
-    } catch (err: any) {
-      setActionBanner(err?.message || 'Failed to queue uploaded video.');
+      }
+    );
+    if (!res.ok) {
+      setActionBanner(res.error || 'Failed to queue uploaded video.');
       setTimeout(() => setActionBanner(null), 3500);
+      return;
     }
+    if (res.data?.room) setRoom(res.data.room);
+    setBottomDeckTab('queue');
   };
 
   // Host Room Settings & Moderation
@@ -788,78 +1079,96 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
     isLocked?: boolean;
     allowParticipantQueue?: boolean;
   }) => {
-    try {
-      const resp = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/settings`, {
+    const res = await safeJsonFetch<{ room: ClientRoomState }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/settings`,
+      {
         method: 'PATCH',
         headers: {
           Authorization: `Bearer ${sessionToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(patch),
+      }
+    );
+
+    if (res.isServerUnavailable) {
+      setRoom((prev) => {
+        const next = { ...prev, ...patch };
+        updateFallbackRoom(room.id, () => next);
+        return next;
       });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || 'Failed to update settings.');
-      if (data.room) setRoom(data.room);
-    } catch (err: any) {
-      setActionBanner(err?.message || 'Could not update settings.');
-      setTimeout(() => setActionBanner(null), 3500);
+      return;
     }
+
+    if (!res.ok) {
+      setActionBanner(res.error || 'Could not update settings.');
+      setTimeout(() => setActionBanner(null), 3500);
+      return;
+    }
+    if (res.data?.room) setRoom(res.data.room);
   };
 
   const handleTransferHost = async (targetMemberId: string) => {
-    try {
-      const resp = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/transfer-host`, {
+    const res = await safeJsonFetch<{ room: ClientRoomState }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/transfer-host`,
+      {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${sessionToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ targetMemberId }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || 'Failed to transfer host role.');
-      if (data.room) setRoom(data.room);
-    } catch (err: any) {
-      setActionBanner(err?.message || 'Transfer host failed.');
+      }
+    );
+    if (!res.ok) {
+      setActionBanner(res.error || 'Transfer host failed.');
       setTimeout(() => setActionBanner(null), 3500);
+      return;
     }
+    if (res.data?.room) setRoom(res.data.room);
   };
 
   const handleKickMember = async (targetMemberId: string) => {
-    try {
-      const resp = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/kick`, {
+    const res = await safeJsonFetch<{ room: ClientRoomState }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/kick`,
+      {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${sessionToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ targetMemberId }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || 'Failed to remove participant.');
-      if (data.room) setRoom(data.room);
-    } catch (err: any) {
-      setActionBanner(err?.message || 'Kick failed.');
+      }
+    );
+    if (!res.ok) {
+      setActionBanner(res.error || 'Kick failed.');
       setTimeout(() => setActionBanner(null), 3500);
+      return;
     }
+    if (res.data?.room) setRoom(res.data.room);
   };
 
   const handleEndRoom = async () => {
-    try {
-      const resp = await fetch(`/api/rooms/${encodeURIComponent(room.id)}/end`, {
+    const res = await safeJsonFetch(
+      `/api/rooms/${encodeURIComponent(room.id)}/end`,
+      {
         method: 'POST',
         headers: { Authorization: `Bearer ${sessionToken}` },
-      });
-      if (!resp.ok) {
-        const data = await resp.json();
-        throw new Error(data.error || 'Failed to end room.');
       }
+    );
+    if (res.isServerUnavailable) {
+      updateFallbackRoom(room.id, (r) => ({ ...r, status: 'ended', isPlaying: false }));
       webrtcRef.current?.destroyAll();
       onLeaveRoom('You ended the watch room.');
-    } catch (err: any) {
-      setActionBanner(err?.message || 'Could not end room.');
-      setTimeout(() => setActionBanner(null), 3500);
+      return;
     }
+    if (!res.ok) {
+      setActionBanner(res.error || 'Could not end room.');
+      setTimeout(() => setActionBanner(null), 3500);
+      return;
+    }
+    webrtcRef.current?.destroyAll();
+    onLeaveRoom('You ended the watch room.');
   };
 
   const uploadedFiles = room.mediaItems.filter((m) => m.sourceType === 'upload');
@@ -873,8 +1182,8 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
     <div className="min-h-screen bg-[#09090F] text-[#F3F4F8] flex flex-col">
       {/* Watch Room Top Navigation Bar */}
       <header className="sticky top-0 z-30 bg-[#0D0D16]/95 backdrop-blur-md border-b border-white/10 px-4 sm:px-6 py-3">
-        <div className="max-w-6xl mx-auto flex items-center justify-between gap-4">
-          {/* Left: Brand + Room Context */}
+        <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-3">
+          {/* Left: Brand + Room Name + Privacy Mode Badge */}
           <div className="flex items-center gap-3 min-w-0">
             <button
               type="button"
@@ -890,23 +1199,23 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
 
             <span className="text-white/20 hidden sm:inline">/</span>
 
-            <div
-              className="min-w-0 flex items-center gap-2"
-              title={room.isLocked ? 'Room is locked' : 'Room is unlocked'}
-            >
-              {room.isLocked ? (
-                <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <div className="min-w-0 flex items-center gap-2">
+              {room.isPrivate ? (
+                <Lock className="w-3.5 h-3.5 text-violet-400 shrink-0" />
               ) : (
-                <Unlock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                <Unlock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
               )}
-              <h1 className="text-sm font-display font-semibold text-white truncate max-w-[140px] sm:max-w-[260px]">
+              <h1 className="text-sm font-display font-semibold text-white truncate max-w-[130px] sm:max-w-[220px]">
                 {room.name}
               </h1>
+              <span className="hidden lg:inline-block text-[11px] text-slate-400 font-mono">
+                ({room.isPrivate ? 'Private · Request to Join' : 'Public · Direct Join'})
+              </span>
             </div>
           </div>
 
-          {/* Right Controls: Connection State, Copy Invite, Leave */}
-          <div className="flex items-center gap-2.5 shrink-0">
+          {/* Right Controls: Unique Room Joining Code (Separate from Video URL) + Copy Link + Leave */}
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
             <div className="hidden md:flex items-center gap-1.5 text-xs text-slate-300 px-2.5 py-1 rounded-md bg-white/5 border border-white/10">
               {connectionState === 'connected' && (
                 <>
@@ -934,21 +1243,43 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
               )}
             </div>
 
+            {/* Dedicated Unique Room Joining Code Copy Button */}
             <button
               type="button"
-              onClick={handleCopyInvite}
+              onClick={handleCopyCodeOnly}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/40 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              title="Copy room invite link"
+              title="Copy Unique Room Joining Code"
             >
-              {copiedInvite ? (
+              {copiedCode ? (
                 <>
                   <Check className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Copied Link</span>
+                  <span>Copied Code!</span>
                 </>
               ) : (
                 <>
-                  <Copy className="w-3.5 h-3.5 text-violet-300" />
-                  <span className="font-mono">{room.inviteCode}</span>
+                  <KeyRound className="w-3.5 h-3.5 text-violet-300" />
+                  <span className="text-slate-300 hidden sm:inline">Room Code:</span>
+                  <span className="font-mono font-bold text-violet-200">{room.inviteCode}</span>
+                </>
+              )}
+            </button>
+
+            {/* Separate Shareable Link Copy Button */}
+            <button
+              type="button"
+              onClick={handleCopyInviteLink}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              title="Copy direct shareable room link"
+            >
+              {copiedInviteLink ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Link Copied</span>
+                </>
+              ) : (
+                <>
+                  <Share2 className="w-3.5 h-3.5 text-slate-300" />
+                  <span className="hidden sm:inline">Share Link</span>
                 </>
               )}
             </button>
@@ -981,13 +1312,63 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
         </div>
       )}
 
-      {/* Vertical Cinema Stack: 1. Video Player -> 2. Live Chat & Active Speakers Box Below Video -> 3. Queue/Members Deck */}
+      {/* Vertical Cinema Stack */}
       <div className="flex-1 max-w-6xl w-full mx-auto flex flex-col gap-4 p-3 sm:p-6 overflow-x-hidden">
-        {/* 1. Synchronized Video Stage */}
+        {/* Host Live Join Requests Banner for Private Rooms */}
+        {isHost && pendingJoinRequests.length > 0 && (
+          <div className="bg-violet-600/15 border border-violet-500/50 rounded-xl p-3.5 flex flex-col gap-2.5 shadow-lg">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-display font-semibold text-white">
+                <UserCheck className="w-4 h-4 text-violet-300 shrink-0" />
+                <span>
+                  Private Room Join Requests ({pendingJoinRequests.length}) — Approve friends to let them in:
+                </span>
+              </div>
+              <span className="text-[11px] font-mono text-violet-200">Code: {room.inviteCode}</span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {pendingJoinRequests.map((reqItem) => (
+                <div
+                  key={reqItem.memberId}
+                  className="px-3 py-2 rounded-lg bg-[#0D0D17] border border-white/10 flex items-center justify-between gap-3"
+                >
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-white truncate">{reqItem.displayName}</div>
+                    <div className="text-[11px] text-slate-400">
+                      Requested via code {room.inviteCode}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => handleRespondToJoinRequest(reqItem.memberId, 'approve')}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-md transition-colors cursor-pointer"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Approve</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleRespondToJoinRequest(reqItem.memberId, 'reject')}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-rose-200 bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/30 rounded-md transition-colors cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      <span>Decline</span>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* 1. Synchronized Video Stage (Includes Separate Inline YouTube Video Link Input) */}
         <VideoStage
           roomId={room.id}
           sessionToken={sessionToken}
           isHost={isHost}
+          allowParticipantQueue={room.allowParticipantQueue}
           playback={{
             activeMediaId: room.activeMediaId,
             activeMediaType: room.activeMediaType,
@@ -1003,6 +1384,13 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
           onOpenAddMediaModal={(tab) => {
             setAddMediaTab(tab);
             setAddMediaOpen(true);
+          }}
+          onQuickPlayYoutubeUrl={async (videoId) => {
+            await handleAddYoutubeToQueue({
+              videoId,
+              title: `YouTube Video (${videoId})`,
+              playImmediately: isHost,
+            });
           }}
         />
 
@@ -1361,7 +1749,10 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
                 }`}
               >
                 <Users className="w-3.5 h-3.5" />
-                <span>Members ({room.members.length}/8)</span>
+                <span>
+                  Members ({room.members.length}/8)
+                  {isHost && pendingJoinRequests.length > 0 ? ` · ${pendingJoinRequests.length} Pending` : ''}
+                </span>
               </button>
 
               <button
@@ -1551,60 +1942,99 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
 
           {/* Tab 3: Room Members & Host Moderation */}
           {bottomDeckTab === 'members' && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              {room.members.map((m) => {
-                const isMemberHost = m.memberId === room.hostId;
-                const isSelf = m.memberId === actor.id;
-                return (
-                  <div
-                    key={m.memberId}
-                    className="p-3 rounded-lg bg-[#09090F] border border-white/10 flex items-center justify-between gap-2"
-                  >
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-xs font-medium text-white truncate">
-                          {m.displayName} {isSelf && '(You)'}
-                        </span>
-                        {isMemberHost && <Crown className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
-                      </div>
-                      <div className="text-[11px] text-slate-400 flex items-center gap-1.5 mt-0.5">
-                        <span>{isMemberHost ? 'Host' : m.role === 'guest' ? 'Guest' : 'Member'}</span>
-                        <span>·</span>
-                        <span>{m.isOnline ? 'Online' : 'Offline'}</span>
-                        {m.inVoice && (
-                          <>
-                            <span>·</span>
-                            <span className="text-violet-300">
-                              {m.isMuted ? 'Voice (Muted)' : 'In Voice'}
-                            </span>
-                          </>
-                        )}
-                      </div>
-                    </div>
-
-                    {isHost && !isSelf && (
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => handleTransferHost(m.memberId)}
-                          title="Make Host"
-                          className="px-2 py-1 text-[11px] font-medium text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 rounded transition-colors cursor-pointer"
-                        >
-                          Make Host
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleKickMember(m.memberId)}
-                          title="Remove participant from room"
-                          className="p-1.5 text-slate-400 hover:text-rose-400 rounded transition-colors cursor-pointer"
-                        >
-                          <UserX className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    )}
+            <div className="space-y-4">
+              {isHost && pendingJoinRequests.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-xs font-semibold text-violet-300">
+                    Pending Join Requests ({pendingJoinRequests.length})
                   </div>
-                );
-              })}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    {pendingJoinRequests.map((reqItem) => (
+                      <div
+                        key={reqItem.memberId}
+                        className="p-3 rounded-lg bg-violet-600/10 border border-violet-500/40 flex items-center justify-between gap-2"
+                      >
+                        <div className="min-w-0">
+                          <div className="text-xs font-medium text-white truncate">{reqItem.displayName}</div>
+                          <div className="text-[11px] text-violet-200">Waiting for host approval</div>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleRespondToJoinRequest(reqItem.memberId, 'approve')}
+                            className="px-2.5 py-1 text-xs font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded transition-colors cursor-pointer"
+                          >
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRespondToJoinRequest(reqItem.memberId, 'reject')}
+                            className="px-2.5 py-1 text-xs font-medium text-rose-200 bg-rose-500/20 hover:bg-rose-500/30 rounded transition-colors cursor-pointer"
+                          >
+                            Decline
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {room.members.map((m) => {
+                  const isMemberHost = m.memberId === room.hostId;
+                  const isSelf = m.memberId === actor.id;
+                  return (
+                    <div
+                      key={m.memberId}
+                      className="p-3 rounded-lg bg-[#09090F] border border-white/10 flex items-center justify-between gap-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs font-medium text-white truncate">
+                            {m.displayName} {isSelf && '(You)'}
+                          </span>
+                          {isMemberHost && <Crown className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
+                        </div>
+                        <div className="text-[11px] text-slate-400 flex items-center gap-1.5 mt-0.5">
+                          <span>{isMemberHost ? 'Host' : m.role === 'guest' ? 'Guest' : 'Member'}</span>
+                          <span>·</span>
+                          <span>{m.isOnline ? 'Online' : 'Offline'}</span>
+                          {m.inVoice && (
+                            <>
+                              <span>·</span>
+                              <span className="text-violet-300">
+                                {m.isMuted ? 'Voice (Muted)' : 'In Voice'}
+                              </span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      {isHost && !isSelf && (
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleTransferHost(m.memberId)}
+                            title="Make Host"
+                            className="px-2 py-1 text-[11px] font-medium text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 rounded transition-colors cursor-pointer"
+                          >
+                            Make Host
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleKickMember(m.memberId)}
+                            title="Remove participant from room"
+                            className="p-1.5 text-slate-400 hover:text-rose-400 rounded transition-colors cursor-pointer"
+                          >
+                            <UserX className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -1628,8 +2058,8 @@ export const WatchRoomPage: React.FC<WatchRoomPageProps> = ({
 
                 <div className="p-3.5 rounded-lg bg-[#09090F] border border-white/10 flex items-center justify-between">
                   <div>
-                    <div className="font-medium text-white">Private Invite Gate</div>
-                    <div className="text-slate-400 text-[11px]">Require invite code to join</div>
+                    <div className="font-medium text-white">Private Room (Join Request)</div>
+                    <div className="text-slate-400 text-[11px]">Require host approval on code join</div>
                   </div>
                   <input
                     type="checkbox"

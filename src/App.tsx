@@ -7,7 +7,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { LandingPage } from './components/LandingPage';
 import { WatchRoomPage, ClientRoomState } from './components/WatchRoomPage';
-import { CreateRoomModal, JoinRoomModal, InfoModal } from './components/Modals';
+import { CreateRoomModal, JoinRoomModal, InfoModal, JoinRoomResult } from './components/Modals';
 import {
   auth,
   onAuthStateChanged,
@@ -15,14 +15,16 @@ import {
   signOutFirebase,
   mirrorRoomCreationToFirestore,
 } from './lib/firebase';
+import {
+  ActorSession,
+  safeJsonFetch,
+  createFallbackSession,
+  createFallbackRoom,
+  joinFallbackRoom,
+  checkFallbackJoinStatus,
+  getFallbackRoom,
+} from './lib/roomEngine';
 import { AlertCircle, X } from 'lucide-react';
-
-interface ActorSession {
-  id: string;
-  displayName: string;
-  avatarUrl: string;
-  authType: 'firebase' | 'guest';
-}
 
 const SESSION_TOKEN_KEY = 'friendsflix_session_token_v1';
 const SESSION_ACTOR_KEY = 'friendsflix_actor_v1';
@@ -57,7 +59,7 @@ export default function App() {
   const [globalNotice, setGlobalNotice] = useState<string | null>(null);
   const [configStatus, setConfigStatus] = useState<any>(null);
 
-  // Helper to obtain or refresh a signed server session token
+  // Helper to obtain or refresh a signed server session token (with safe fallback on static hosts like Vercel)
   const ensureServerSession = useCallback(
     async (params: {
       displayName: string;
@@ -65,7 +67,7 @@ export default function App() {
       authType?: 'firebase' | 'guest';
       avatarUrl?: string;
     }): Promise<{ actor: ActorSession; token: string }> => {
-      const resp = await fetch('/api/auth/session', {
+      const res = await safeJsonFetch<{ actor: ActorSession; token: string }>('/api/auth/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -76,29 +78,51 @@ export default function App() {
           avatarUrl: params.avatarUrl ?? actor?.avatarUrl ?? '',
         }),
       });
-      const data = await resp.json();
-      if (!resp.ok) {
-        throw new Error(data.error || 'Could not initialize session.');
+
+      if (res.isServerUnavailable) {
+        const fallback = createFallbackSession({
+          displayName: params.displayName,
+          externalUid: params.externalUid,
+          authType: params.authType || actor?.authType || 'guest',
+          avatarUrl: params.avatarUrl ?? actor?.avatarUrl ?? '',
+          existingActorId: actor?.id,
+        });
+        setActor(fallback.actor);
+        setSessionToken(fallback.token);
+        try {
+          sessionStorage.setItem(SESSION_ACTOR_KEY, JSON.stringify(fallback.actor));
+          sessionStorage.setItem(SESSION_TOKEN_KEY, fallback.token);
+        } catch {
+          // ignore
+        }
+        return fallback;
       }
 
-      setActor(data.actor);
-      setSessionToken(data.token);
+      if (!res.ok || !res.data) {
+        throw new Error(res.error || 'Could not initialize session.');
+      }
+
+      setActor(res.data.actor);
+      setSessionToken(res.data.token);
       try {
-        sessionStorage.setItem(SESSION_ACTOR_KEY, JSON.stringify(data.actor));
-        sessionStorage.setItem(SESSION_TOKEN_KEY, data.token);
+        sessionStorage.setItem(SESSION_ACTOR_KEY, JSON.stringify(res.data.actor));
+        sessionStorage.setItem(SESSION_TOKEN_KEY, res.data.token);
       } catch {
         // ignore storage errors
       }
-      return { actor: data.actor, token: data.token };
+      return { actor: res.data.actor, token: res.data.token };
     },
     [sessionToken, actor]
   );
 
-  // 1. Load backend configuration status
+  // 1. Load backend configuration status safely
   useEffect(() => {
-    fetch('/api/config-status')
-      .then((r) => r.json())
-      .then((data) => setConfigStatus(data))
+    safeJsonFetch('/api/config-status')
+      .then((res) => {
+        if (res.ok && res.data) {
+          setConfigStatus(res.data);
+        }
+      })
       .catch(() => {});
   }, []);
 
@@ -129,27 +153,32 @@ export default function App() {
     const codeParam = params.get('code');
 
     if (codeParam || roomParam) {
-      // If user already has a valid session and is a member of this room, try loading it directly
       const savedToken = sessionStorage.getItem(SESSION_TOKEN_KEY);
       if (savedToken && roomParam) {
-        fetch(`/api/rooms/${encodeURIComponent(roomParam)}`, {
+        safeJsonFetch<{ room: ClientRoomState }>(`/api/rooms/${encodeURIComponent(roomParam)}`, {
           headers: { Authorization: `Bearer ${savedToken}` },
         })
-          .then(async (resp) => {
-            if (resp.ok) {
-              const data = await resp.json();
-              setActiveRoom(data.room);
-            } else {
-              setInitialJoinCode(window.location.href);
-              setJoinModalOpen(true);
+          .then((res) => {
+            if (res.ok && res.data?.room) {
+              setActiveRoom(res.data.room);
+              return;
             }
+            if (res.isServerUnavailable) {
+              const localRoom = getFallbackRoom(roomParam);
+              if (localRoom && actor && localRoom.members.some((m) => m.memberId === actor.id)) {
+                setActiveRoom(localRoom);
+                return;
+              }
+            }
+            setInitialJoinCode((codeParam || roomParam || '').toUpperCase());
+            setJoinModalOpen(true);
           })
           .catch(() => {
-            setInitialJoinCode(window.location.href);
+            setInitialJoinCode((codeParam || roomParam || '').toUpperCase());
             setJoinModalOpen(true);
           });
       } else {
-        setInitialJoinCode(codeParam || window.location.href);
+        setInitialJoinCode((codeParam || roomParam || '').toUpperCase());
         setJoinModalOpen(true);
       }
       return;
@@ -159,13 +188,19 @@ export default function App() {
     const savedRoomId = sessionStorage.getItem(ACTIVE_ROOM_ID_KEY);
     const savedToken = sessionStorage.getItem(SESSION_TOKEN_KEY);
     if (savedRoomId && savedToken) {
-      fetch(`/api/rooms/${encodeURIComponent(savedRoomId)}`, {
+      safeJsonFetch<{ room: ClientRoomState }>(`/api/rooms/${encodeURIComponent(savedRoomId)}`, {
         headers: { Authorization: `Bearer ${savedToken}` },
       })
-        .then(async (resp) => {
-          if (resp.ok) {
-            const data = await resp.json();
-            setActiveRoom(data.room);
+        .then((res) => {
+          if (res.ok && res.data?.room) {
+            setActiveRoom(res.data.room);
+          } else if (res.isServerUnavailable) {
+            const localRoom = getFallbackRoom(savedRoomId);
+            if (localRoom) {
+              setActiveRoom(localRoom);
+            } else {
+              sessionStorage.removeItem(ACTIVE_ROOM_ID_KEY);
+            }
           } else {
             sessionStorage.removeItem(ACTIVE_ROOM_ID_KEY);
           }
@@ -212,6 +247,7 @@ export default function App() {
     roomName: string;
     displayName: string;
     isPrivate: boolean;
+    customInviteCode: string;
     initialYoutubeId: string;
     initialYoutubeTitle: string;
   }) => {
@@ -222,7 +258,7 @@ export default function App() {
       avatarUrl: auth.currentUser?.photoURL || '',
     });
 
-    const resp = await fetch('/api/rooms', {
+    const res = await safeJsonFetch<{ room: ClientRoomState }>('/api/rooms', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${session.token}`,
@@ -231,17 +267,29 @@ export default function App() {
       body: JSON.stringify({
         name: params.roomName,
         isPrivate: params.isPrivate,
+        customInviteCode: params.customInviteCode,
         initialYoutubeId: params.initialYoutubeId,
         initialYoutubeTitle: params.initialYoutubeTitle,
       }),
     });
 
-    const data = await resp.json();
-    if (!resp.ok) {
-      throw new Error(data.error || 'Failed to create room.');
+    let room: ClientRoomState;
+
+    if (res.isServerUnavailable) {
+      room = createFallbackRoom({
+        actor: session.actor,
+        name: params.roomName,
+        isPrivate: params.isPrivate,
+        customInviteCode: params.customInviteCode,
+        initialYoutubeId: params.initialYoutubeId,
+        initialYoutubeTitle: params.initialYoutubeTitle,
+      });
+    } else if (!res.ok || !res.data?.room) {
+      throw new Error(res.error || 'Failed to create room.');
+    } else {
+      room = res.data.room;
     }
 
-    const room: ClientRoomState = data.room;
     setCreatedPendingRoom(room);
 
     // Mirror room creation to Firestore if signed in with Google
@@ -261,6 +309,7 @@ export default function App() {
       id: room.id,
       inviteCode: room.inviteCode,
       name: room.name,
+      isPrivate: room.isPrivate,
     };
   };
 
@@ -277,8 +326,11 @@ export default function App() {
     setCreateModalOpen(false);
   };
 
-  // Join Room Flow
-  const handleJoinRoom = async (params: { roomCodeOrLink: string; displayName: string }) => {
+  // Join Room Flow (Public = Direct Join, Private = Send Join Request to Host)
+  const handleJoinRoom = async (params: {
+    roomCodeOrLink: string;
+    displayName: string;
+  }): Promise<JoinRoomResult> => {
     const session = await ensureServerSession({
       displayName: params.displayName,
       externalUid: auth.currentUser?.uid,
@@ -286,7 +338,14 @@ export default function App() {
       avatarUrl: auth.currentUser?.photoURL || '',
     });
 
-    const resp = await fetch('/api/rooms/join', {
+    const res = await safeJsonFetch<{
+      status?: 'joined' | 'pending_approval';
+      room?: ClientRoomState;
+      roomId?: string;
+      roomName?: string;
+      inviteCode?: string;
+      message?: string;
+    }>('/api/rooms/join', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${session.token}`,
@@ -297,21 +356,116 @@ export default function App() {
       }),
     });
 
-    const data = await resp.json();
-    if (!resp.ok) {
-      throw new Error(data.error || 'Could not join watch room.');
+    if (res.isServerUnavailable) {
+      const fallbackRes = joinFallbackRoom({
+        actor: session.actor,
+        roomCodeOrLink: params.roomCodeOrLink,
+      });
+
+      if (fallbackRes.status === 'pending_approval') {
+        return {
+          status: 'pending_approval',
+          roomId: fallbackRes.roomId,
+          roomName: fallbackRes.roomName,
+          inviteCode: fallbackRes.inviteCode,
+          message: fallbackRes.message,
+        };
+      }
+
+      setActiveRoom(fallbackRes.room);
+      sessionStorage.setItem(ACTIVE_ROOM_ID_KEY, fallbackRes.room.id);
+      window.history.replaceState(
+        {},
+        '',
+        `/?room=${encodeURIComponent(fallbackRes.room.id)}&code=${encodeURIComponent(fallbackRes.room.inviteCode)}`
+      );
+      setJoinModalOpen(false);
+      return { status: 'joined' };
     }
 
-    const room: ClientRoomState = data.room;
-    setActiveRoom(room);
-    sessionStorage.setItem(ACTIVE_ROOM_ID_KEY, room.id);
-    window.history.replaceState(
-      {},
-      '',
-      `/?room=${encodeURIComponent(room.id)}&code=${encodeURIComponent(room.inviteCode)}`
-    );
-    setJoinModalOpen(false);
+    if (!res.ok || !res.data) {
+      throw new Error(res.error || 'Could not join watch room.');
+    }
+
+    if (res.data.status === 'pending_approval' && res.data.roomId) {
+      return {
+        status: 'pending_approval',
+        roomId: res.data.roomId,
+        roomName: res.data.roomName || 'Private Watch Room',
+        inviteCode: res.data.inviteCode || params.roomCodeOrLink.toUpperCase(),
+        message: res.data.message || 'Join request sent to the room host. Waiting for approval...',
+      };
+    }
+
+    if (res.data.room) {
+      const room = res.data.room;
+      setActiveRoom(room);
+      sessionStorage.setItem(ACTIVE_ROOM_ID_KEY, room.id);
+      window.history.replaceState(
+        {},
+        '',
+        `/?room=${encodeURIComponent(room.id)}&code=${encodeURIComponent(room.inviteCode)}`
+      );
+      setJoinModalOpen(false);
+      return { status: 'joined' };
+    }
+
+    throw new Error('Unexpected response while joining room.');
   };
+
+  // Poll Private Room Join Request Status
+  const handleCheckJoinRequestStatus = useCallback(
+    async (
+      roomId: string
+    ): Promise<{ status: 'approved' | 'rejected' | 'pending'; error?: string }> => {
+      if (!actor || !sessionToken) return { status: 'pending' };
+
+      const res = await safeJsonFetch<{
+        status: 'approved' | 'rejected' | 'pending';
+        room?: ClientRoomState;
+        error?: string;
+      }>(`/api/rooms/${encodeURIComponent(roomId)}/join-status`, {
+        headers: { Authorization: `Bearer ${sessionToken}` },
+      });
+
+      if (res.isServerUnavailable) {
+        const fallbackCheck = checkFallbackJoinStatus({ roomId, actorId: actor.id });
+        if (fallbackCheck.status === 'approved' && fallbackCheck.room) {
+          setActiveRoom(fallbackCheck.room);
+          sessionStorage.setItem(ACTIVE_ROOM_ID_KEY, fallbackCheck.room.id);
+          window.history.replaceState(
+            {},
+            '',
+            `/?room=${encodeURIComponent(fallbackCheck.room.id)}&code=${encodeURIComponent(
+              fallbackCheck.room.inviteCode
+            )}`
+          );
+          setJoinModalOpen(false);
+        }
+        return { status: fallbackCheck.status, error: fallbackCheck.error };
+      }
+
+      if (res.data?.status === 'approved' && res.data.room) {
+        const room = res.data.room;
+        setActiveRoom(room);
+        sessionStorage.setItem(ACTIVE_ROOM_ID_KEY, room.id);
+        window.history.replaceState(
+          {},
+          '',
+          `/?room=${encodeURIComponent(room.id)}&code=${encodeURIComponent(room.inviteCode)}`
+        );
+        setJoinModalOpen(false);
+        return { status: 'approved' };
+      }
+
+      if (res.data?.status === 'rejected') {
+        return { status: 'rejected', error: res.data.error };
+      }
+
+      return { status: 'pending' };
+    },
+    [actor, sessionToken]
+  );
 
   const handleLeaveRoom = (reason?: string) => {
     setActiveRoom(null);
@@ -372,6 +526,7 @@ export default function App() {
         initialCodeOrLink={initialJoinCode}
         defaultDisplayName={actor?.displayName || ''}
         onJoinRoom={handleJoinRoom}
+        onCheckJoinRequestStatus={handleCheckJoinRequestStatus}
       />
 
       <InfoModal

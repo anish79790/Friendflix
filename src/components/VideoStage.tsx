@@ -12,6 +12,7 @@ import {
   Upload,
   Youtube,
 } from 'lucide-react';
+import { parseYouTubeVideoId } from '../lib/youtube';
 
 declare global {
   interface Window {
@@ -60,11 +61,13 @@ interface VideoStageProps {
   roomId: string;
   sessionToken: string;
   isHost: boolean;
+  allowParticipantQueue?: boolean;
   playback: PlaybackStateSnapshot;
   onHostBroadcastPlayback: (nextState: Partial<PlaybackStateSnapshot>) => void;
   onRequestSyncFromServer: () => void;
   onPlayNextInQueue: () => void;
   onOpenAddMediaModal: (tab: 'youtube' | 'upload') => void;
+  onQuickPlayYoutubeUrl?: (videoId: string) => Promise<void>;
 }
 
 const DRIFT_TOLERANCE_SECONDS = 1.85;
@@ -73,11 +76,13 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   roomId,
   sessionToken,
   isHost,
+  allowParticipantQueue = false,
   playback,
   onHostBroadcastPlayback,
   onRequestSyncFromServer,
   onPlayNextInQueue,
   onOpenAddMediaModal,
+  onQuickPlayYoutubeUrl,
 }) => {
   const ytContainerRef = useRef<HTMLDivElement | null>(null);
   const ytPlayerRef = useRef<any>(null);
@@ -94,6 +99,10 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [localCurrentTime, setLocalCurrentTime] = useState<number>(playback.playbackPosition || 0);
   const [localDuration, setLocalDuration] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(false);
+
+  // Dedicated Quick YouTube Video Link Input (separate from Room Joining Code)
+  const [quickYtUrl, setQuickYtUrl] = useState<string>('');
+  const [quickYtLoading, setQuickYtLoading] = useState<boolean>(false);
 
   // Signed URL state for private uploaded video
   const [signedUploadUrl, setSignedUploadUrl] = useState<string>('');
@@ -718,7 +727,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
               <Youtube className="w-3.5 h-3.5 text-rose-400" />
-              <span>YouTube URL</span>
+              <span>More YouTube Options</span>
             </button>
             <button
               onClick={() => onOpenAddMediaModal('upload')}
@@ -729,6 +738,60 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Dedicated Inline YouTube Video Link Input (100% Separate from Room Joining Code) */}
+        {(isHost || allowParticipantQueue) && onQuickPlayYoutubeUrl && (
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const raw = quickYtUrl.trim();
+              if (!raw) return;
+              if (raw.toUpperCase().startsWith('FFX-')) {
+                setPlayerError(
+                  'That is a Room Joining Code! Paste only a YouTube video link (e.g. https://www.youtube.com/watch?v=...) in this video box.'
+                );
+                return;
+              }
+              const parsedId = parseYouTubeVideoId(raw);
+              if (!parsedId) {
+                setPlayerError(
+                  'Invalid YouTube video link. Please paste a valid https://www.youtube.com/watch?v=... or https://youtu.be/... link.'
+                );
+                return;
+              }
+              setPlayerError(null);
+              setQuickYtLoading(true);
+              try {
+                await onQuickPlayYoutubeUrl(parsedId);
+                setQuickYtUrl('');
+              } catch (err: any) {
+                setPlayerError(err?.message || 'Failed to load YouTube video.');
+              } finally {
+                setQuickYtLoading(false);
+              }
+            }}
+            className="pt-2 border-t border-white/10 flex flex-col sm:flex-row items-stretch sm:items-center gap-2"
+          >
+            <div className="flex items-center gap-2 flex-1 min-w-0 bg-[#09090F] border border-white/10 rounded-lg px-3 py-1.5 focus-within:border-violet-500">
+              <Youtube className="w-4 h-4 text-rose-400 shrink-0" />
+              <input
+                type="text"
+                value={quickYtUrl}
+                onChange={(e) => setQuickYtUrl(e.target.value)}
+                placeholder="Paste YouTube video link here (e.g. https://www.youtube.com/watch?v=...)"
+                className="w-full text-xs sm:text-sm bg-transparent text-white placeholder-slate-500 focus:outline-none"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={!quickYtUrl.trim() || quickYtLoading}
+              className="inline-flex items-center justify-center gap-1.5 px-4 py-1.5 text-xs font-medium text-white bg-rose-600 hover:bg-rose-500 disabled:opacity-40 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>{quickYtLoading ? 'Loading...' : isHost ? 'Play YouTube Video' : 'Queue YouTube Video'}</span>
+            </button>
+          </form>
+        )}
       </div>
     </div>
   );

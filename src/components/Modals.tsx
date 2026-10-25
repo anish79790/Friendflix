@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   X,
   Copy,
@@ -14,11 +14,16 @@ import {
   RotateCcw,
   ShieldCheck,
   Database,
+  RefreshCw,
+  KeyRound,
+  UserCheck,
+  Clock,
 } from 'lucide-react';
 import { CURATED_YOUTUBE_PRESETS, parseYouTubeVideoId } from '../lib/youtube';
+import { generateUniqueInviteCode, isYouTubeLink } from '../lib/roomEngine';
 
 // ============================================================================
-// 1. Create Room Dialog
+// 1. Create Room Dialog (Separated Unique Room Code & Optional YouTube Link)
 // ============================================================================
 interface CreateRoomModalProps {
   isOpen: boolean;
@@ -29,9 +34,10 @@ interface CreateRoomModalProps {
     roomName: string;
     displayName: string;
     isPrivate: boolean;
+    customInviteCode: string;
     initialYoutubeId: string;
     initialYoutubeTitle: string;
-  }) => Promise<{ id: string; inviteCode: string; name: string }>;
+  }) => Promise<{ id: string; inviteCode: string; name: string; isPrivate: boolean }>;
   onEnterCreatedRoom: (roomId: string) => void;
 }
 
@@ -46,19 +52,50 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
   const [roomName, setRoomName] = useState('Friday Night Cinema');
   const [displayName, setDisplayName] = useState(defaultDisplayName || '');
   const [isPrivate, setIsPrivate] = useState(true);
-  const [youtubeInput, setYoutubeInput] = useState(CURATED_YOUTUBE_PRESETS[0].id);
-  const [youtubeTitle, setYoutubeTitle] = useState(CURATED_YOUTUBE_PRESETS[0].title);
+  const [uniqueRoomCode, setUniqueRoomCode] = useState<string>(() => generateUniqueInviteCode());
+  const [copiedPreviewCode, setCopiedPreviewCode] = useState(false);
+
+  // Separate YouTube Link state — empty by default so it is never confused with the Room Code
+  const [youtubeUrlInput, setYoutubeUrlInput] = useState('');
+  const [youtubeTitle, setYoutubeTitle] = useState('');
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [createdRoom, setCreatedRoom] = useState<{
     id: string;
     inviteCode: string;
     name: string;
+    isPrivate: boolean;
   } | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
 
+  // Generate a brand-new unique random room code every time the Create Room modal opens
+  useEffect(() => {
+    if (isOpen) {
+      setUniqueRoomCode(generateUniqueInviteCode());
+      setCreatedRoom(null);
+      setError(null);
+      setYoutubeUrlInput('');
+      setYoutubeTitle('');
+      if (defaultDisplayName && !displayName) {
+        setDisplayName(defaultDisplayName);
+      }
+    }
+  }, [isOpen]);
+
   if (!isOpen) return null;
+
+  const handleRegenerateCode = () => {
+    setUniqueRoomCode(generateUniqueInviteCode());
+    setCopiedPreviewCode(false);
+  };
+
+  const handleCopyPreviewCode = async () => {
+    await navigator.clipboard.writeText(uniqueRoomCode);
+    setCopiedPreviewCode(true);
+    setTimeout(() => setCopiedPreviewCode(false), 2000);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -77,10 +114,17 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
     }
 
     let parsedYtId = '';
-    if (youtubeInput.trim()) {
-      const id = parseYouTubeVideoId(youtubeInput.trim());
+    const trimmedYt = youtubeUrlInput.trim();
+    if (trimmedYt) {
+      if (trimmedYt.toUpperCase().startsWith('FFX-')) {
+        setError(
+          'You pasted a Room Joining Code into the YouTube Video Link box. Leave the YouTube box blank or paste a YouTube video link.'
+        );
+        return;
+      }
+      const id = parseYouTubeVideoId(trimmedYt);
       if (!id) {
-        setError('Please enter a valid YouTube video URL or 11-character video ID, or leave it blank.');
+        setError('Please paste a valid YouTube video link (e.g. https://www.youtube.com/watch?v=...) or leave it blank.');
         return;
       }
       parsedYtId = id;
@@ -92,8 +136,9 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
         roomName: cleanRoomName,
         displayName: cleanName,
         isPrivate,
+        customInviteCode: uniqueRoomCode,
         initialYoutubeId: parsedYtId,
-        initialYoutubeTitle: youtubeTitle.trim() || 'Featured Selection',
+        initialYoutubeTitle: youtubeTitle.trim() || (parsedYtId ? 'Featured Watch Party Video' : ''),
       });
       setCreatedRoom(result);
     } catch (err: any) {
@@ -125,16 +170,16 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
-      <div className="bg-[#12121E] border border-white/10 rounded-xl max-w-lg w-full p-6 space-y-5 shadow-2xl">
+      <div className="bg-[#12121E] border border-white/10 rounded-xl max-w-lg w-full p-6 space-y-5 shadow-2xl my-auto">
         <div className="flex items-center justify-between border-b border-white/10 pb-4">
           <div>
             <h2 className="text-lg font-display font-semibold text-white">
-              {createdRoom ? 'Watch Room Created' : 'Create a Watch Room'}
+              {createdRoom ? 'Watch Room Ready' : 'Create a Watch Room'}
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
               {createdRoom
-                ? 'Share the invitation link or room code with your friends.'
-                : 'Configure your synchronized room and invite up to 8 participants.'}
+                ? 'Share your unique Room Code or invite link with friends.'
+                : 'Configure your synchronized room, unique joining code, and privacy mode.'}
             </p>
           </div>
           <button
@@ -152,30 +197,38 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
 
         {createdRoom ? (
           <div className="space-y-5">
-            <div className="p-4 rounded-lg bg-[#0B0B13] border border-white/10 space-y-3">
+            <div className="p-4 rounded-lg bg-[#0B0B13] border border-violet-500/30 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs text-slate-400">Room Name</span>
                 <span className="text-sm font-medium text-white">{createdRoom.name}</span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-xs text-slate-400">Invite Code</span>
+                <span className="text-xs text-slate-400">Privacy Mode</span>
+                <span className="text-xs font-medium text-violet-300">
+                  {createdRoom.isPrivate
+                    ? 'Private Room (Friends send Join Request)'
+                    : 'Public Room (Friends join directly)'}
+                </span>
+              </div>
+              <div className="pt-2 border-t border-white/10 flex items-center justify-between">
+                <span className="text-xs font-medium text-slate-300">Unique Room Joining Code</span>
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-mono font-semibold text-violet-300 tracking-wider">
+                  <span className="text-base font-mono font-bold text-violet-300 tracking-wider bg-violet-500/10 px-2.5 py-1 rounded border border-violet-500/30">
                     {createdRoom.inviteCode}
                   </span>
                   <button
                     onClick={handleCopyCode}
-                    className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-200 bg-white/5 hover:bg-white/10 rounded transition-colors cursor-pointer"
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-white bg-violet-600 hover:bg-violet-500 rounded-md transition-colors cursor-pointer"
                   >
-                    {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                    <span>{copiedCode ? 'Copied' : 'Copy'}</span>
+                    {copiedCode ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copiedCode ? 'Copied' : 'Copy Code'}</span>
                   </button>
                 </div>
               </div>
             </div>
 
             <div className="space-y-1.5">
-              <label className="block text-xs font-medium text-slate-300">Shareable Invite Link</label>
+              <label className="block text-xs font-medium text-slate-300">Direct Shareable Room Link</label>
               <div className="flex items-center gap-2">
                 <input
                   type="text"
@@ -216,104 +269,186 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
               </div>
             )}
 
-            <div className="space-y-1.5">
-              <label htmlFor="create-room-name" className="block text-xs font-medium text-slate-300">
-                Room Name
-              </label>
-              <input
-                id="create-room-name"
-                type="text"
-                required
-                maxLength={80}
-                value={roomName}
-                onChange={(e) => setRoomName(e.target.value)}
-                placeholder="e.g., Sci-Fi Short Film Night"
-                className="w-full px-3.5 py-2 text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
-              />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <label htmlFor="create-room-name" className="block text-xs font-medium text-slate-300">
+                  Room Name
+                </label>
+                <input
+                  id="create-room-name"
+                  type="text"
+                  required
+                  maxLength={80}
+                  value={roomName}
+                  onChange={(e) => setRoomName(e.target.value)}
+                  placeholder="e.g., Friday Night Cinema"
+                  className="w-full px-3.5 py-2 text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label htmlFor="create-host-nickname" className="block text-xs font-medium text-slate-300">
+                  {isAuthenticatedUser ? 'Your Host Name' : 'Your Host Nickname'}
+                </label>
+                <input
+                  id="create-host-nickname"
+                  type="text"
+                  required
+                  maxLength={40}
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  placeholder="Enter your nickname"
+                  className="w-full px-3.5 py-2 text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                />
+              </div>
             </div>
 
+            {/* Room Privacy Selector: Private (Join Request) vs Public (Direct Join) */}
             <div className="space-y-1.5">
-              <label htmlFor="create-host-nickname" className="block text-xs font-medium text-slate-300">
-                {isAuthenticatedUser ? 'Your Display Name (Signed In)' : 'Your Host Nickname (Guest Session)'}
-              </label>
-              <input
-                id="create-host-nickname"
-                type="text"
-                required
-                maxLength={40}
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-                placeholder="Enter your display name"
-                className="w-full px-3.5 py-2 text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
-              />
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="block text-xs font-medium text-slate-300">Room Access & Privacy</label>
+              <label className="block text-xs font-medium text-slate-300">Room Access & Join Mode</label>
               <div className="grid grid-cols-2 gap-2.5">
                 <button
                   type="button"
                   onClick={() => setIsPrivate(true)}
-                  className={`flex items-center gap-2.5 p-3 rounded-lg border text-left transition-colors cursor-pointer ${
+                  className={`flex items-start gap-2.5 p-3 rounded-lg border text-left transition-colors cursor-pointer ${
                     isPrivate
-                      ? 'bg-violet-600/15 border-violet-500/50 text-white'
+                      ? 'bg-violet-600/15 border-violet-500/60 text-white'
                       : 'bg-[#09090F] border-white/10 text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  <Lock className="w-4 h-4 text-violet-400 shrink-0" />
+                  <Lock className="w-4 h-4 text-violet-400 shrink-0 mt-0.5" />
                   <div>
-                    <div className="text-xs font-medium">Private Room</div>
-                    <div className="text-[11px] text-slate-400">Invite code required</div>
+                    <div className="text-xs font-semibold">Private Room</div>
+                    <div className="text-[11px] text-slate-400 leading-snug mt-0.5">
+                      Code sends Join Request for Host approval
+                    </div>
                   </div>
                 </button>
                 <button
                   type="button"
                   onClick={() => setIsPrivate(false)}
-                  className={`flex items-center gap-2.5 p-3 rounded-lg border text-left transition-colors cursor-pointer ${
+                  className={`flex items-start gap-2.5 p-3 rounded-lg border text-left transition-colors cursor-pointer ${
                     !isPrivate
-                      ? 'bg-violet-600/15 border-violet-500/50 text-white'
+                      ? 'bg-violet-600/15 border-violet-500/60 text-white'
                       : 'bg-[#09090F] border-white/10 text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  <Globe className="w-4 h-4 text-slate-400 shrink-0" />
+                  <Globe className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                   <div>
-                    <div className="text-xs font-medium">Open Room</div>
-                    <div className="text-[11px] text-slate-400">Joinable by room ID</div>
+                    <div className="text-xs font-semibold">Public Room</div>
+                    <div className="text-[11px] text-slate-400 leading-snug mt-0.5">
+                      Code joins directly without request
+                    </div>
                   </div>
                 </button>
               </div>
             </div>
 
-            <div className="space-y-2">
-              <label htmlFor="initial-yt-input" className="block text-xs font-medium text-slate-300">
-                Starting YouTube Video URL or ID (Optional)
-              </label>
+            {/* SECTION 1: Dedicated Unique Room Joining Code Box (Completely Separate from YouTube Video) */}
+            <div className="p-3.5 rounded-xl bg-[#09090F] border border-violet-500/35 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-violet-200">
+                  <KeyRound className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                  <span>Unique Room Joining Code (Share with Friends)</span>
+                </div>
+                <span className="text-[11px] font-mono text-emerald-400">Auto-Generated Unique</span>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 pt-0.5">
+                <div className="px-3 py-2 rounded-lg bg-[#12121E] border border-white/10 font-mono text-sm sm:text-base font-bold tracking-wider text-white select-all flex-1">
+                  {uniqueRoomCode}
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCopyPreviewCode}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg transition-colors cursor-pointer shrink-0"
+                  title="Copy unique room code"
+                >
+                  {copiedPreviewCode ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Copied</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRegenerateCode}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-violet-200 bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/40 rounded-lg transition-colors cursor-pointer shrink-0"
+                  title="Generate a new random unique room code"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>New Code</span>
+                </button>
+              </div>
+
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                {isPrivate
+                  ? 'Private Mode: Friends enter this code in "Join Room" to send a Join Request. You approve them inside the room.'
+                  : 'Public Mode: Friends enter this code in "Join Room" to join directly without waiting for approval.'}
+              </p>
+            </div>
+
+            {/* SECTION 2: Completely Separate Optional YouTube Video URL Input */}
+            <div className="pt-2 border-t border-white/10 space-y-2">
+              <div className="flex items-center justify-between">
+                <label htmlFor="initial-yt-input" className="flex items-center gap-1.5 text-xs font-medium text-slate-300">
+                  <Youtube className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>Starting YouTube Video Link (Optional — Separate from Room Code)</span>
+                </label>
+                {youtubeUrlInput && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setYoutubeUrlInput('');
+                      setYoutubeTitle('');
+                    }}
+                    className="text-[11px] text-slate-400 hover:text-white cursor-pointer"
+                  >
+                    Clear Video
+                  </button>
+                )}
+              </div>
               <input
                 id="initial-yt-input"
                 type="text"
-                value={youtubeInput}
-                onChange={(e) => setYoutubeInput(e.target.value)}
-                placeholder="Paste a YouTube link or 11-character ID"
-                className="w-full px-3.5 py-2 text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                value={youtubeUrlInput}
+                onChange={(e) => setYoutubeUrlInput(e.target.value)}
+                placeholder="https://www.youtube.com/watch?v=... (Leave empty to add video later)"
+                className="w-full px-3.5 py-2 text-xs sm:text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
               />
-              <div className="flex flex-wrap gap-1.5 pt-1">
-                {CURATED_YOUTUBE_PRESETS.map((preset) => (
-                  <button
-                    key={preset.id}
-                    type="button"
-                    onClick={() => {
-                      setYoutubeInput(preset.id);
-                      setYoutubeTitle(preset.title);
-                    }}
-                    className={`px-2.5 py-1 text-xs rounded-md border transition-colors cursor-pointer ${
-                      youtubeInput === preset.id
-                        ? 'bg-violet-600/20 border-violet-500/50 text-violet-200'
-                        : 'bg-white/5 border-white/10 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {preset.title.split('—')[0].trim()}
-                  </button>
-                ))}
+              <div className="space-y-1 pt-0.5">
+                <span className="block text-[11px] text-slate-400">
+                  Or load a sample open-cinema film link (optional):
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {CURATED_YOUTUBE_PRESETS.map((preset) => {
+                    const fullUrl = `https://www.youtube.com/watch?v=${preset.id}`;
+                    const isSelected = youtubeUrlInput === fullUrl;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => {
+                          setYoutubeUrlInput(fullUrl);
+                          setYoutubeTitle(preset.title);
+                        }}
+                        className={`px-2.5 py-1 text-[11px] rounded-md border transition-colors cursor-pointer ${
+                          isSelected
+                            ? 'bg-rose-500/20 border-rose-500/50 text-rose-200'
+                            : 'bg-white/5 border-white/10 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        ▶ {preset.title.split('—')[0].trim()}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             </div>
 
@@ -342,14 +477,28 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
 };
 
 // ============================================================================
-// 2. Join Room Dialog
+// 2. Join Room Dialog (Direct Join for Public Rooms, Join Request for Private Rooms)
 // ============================================================================
+export type JoinRoomResult =
+  | { status: 'joined' }
+  | {
+      status: 'pending_approval';
+      roomId: string;
+      roomName: string;
+      inviteCode: string;
+      message: string;
+    };
+
 interface JoinRoomModalProps {
   isOpen: boolean;
   onClose: () => void;
   initialCodeOrLink?: string;
   defaultDisplayName: string;
-  onJoinRoom: (params: { roomCodeOrLink: string; displayName: string }) => Promise<void>;
+  onJoinRoom: (params: { roomCodeOrLink: string; displayName: string }) => Promise<JoinRoomResult>;
+  onCheckJoinRequestStatus: (roomId: string) => Promise<{
+    status: 'approved' | 'rejected' | 'pending';
+    error?: string;
+  }>;
 }
 
 export const JoinRoomModal: React.FC<JoinRoomModalProps> = ({
@@ -358,19 +507,63 @@ export const JoinRoomModal: React.FC<JoinRoomModalProps> = ({
   initialCodeOrLink = '',
   defaultDisplayName,
   onJoinRoom,
+  onCheckJoinRequestStatus,
 }) => {
   const [roomCodeOrLink, setRoomCodeOrLink] = useState(initialCodeOrLink);
   const [displayName, setDisplayName] = useState(defaultDisplayName || '');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  React.useEffect(() => {
+  // Pending approval state for Private Rooms
+  const [pendingRequest, setPendingRequest] = useState<{
+    roomId: string;
+    roomName: string;
+    inviteCode: string;
+    message: string;
+  } | null>(null);
+
+  useEffect(() => {
     if (initialCodeOrLink) setRoomCodeOrLink(initialCodeOrLink);
   }, [initialCodeOrLink]);
 
-  React.useEffect(() => {
+  useEffect(() => {
     if (defaultDisplayName && !displayName) setDisplayName(defaultDisplayName);
   }, [defaultDisplayName]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setPendingRequest(null);
+      setError(null);
+      setLoading(false);
+    }
+  }, [isOpen]);
+
+  // Poll join request status every 2 seconds while waiting for Private Room host approval
+  useEffect(() => {
+    if (!isOpen || !pendingRequest) return;
+
+    let cancelled = false;
+    const interval = window.setInterval(async () => {
+      if (cancelled) return;
+      try {
+        const res = await onCheckJoinRequestStatus(pendingRequest.roomId);
+        if (cancelled) return;
+        if (res.status === 'approved') {
+          setPendingRequest(null);
+        } else if (res.status === 'rejected') {
+          setPendingRequest(null);
+          setError(res.error || 'The room host declined your join request.');
+        }
+      } catch {
+        // ignore transient polling errors
+      }
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [isOpen, pendingRequest, onCheckJoinRequestStatus]);
 
   if (!isOpen) return null;
 
@@ -382,9 +575,17 @@ export const JoinRoomModal: React.FC<JoinRoomModalProps> = ({
     const cleanName = displayName.trim();
 
     if (!cleanInput) {
-      setError('Please enter an invite code (e.g. ABCD-1234) or paste a shareable room link.');
+      setError('Please enter a Unique Room Code (e.g. FFX-7K9M-4P2X) or paste a shareable room link.');
       return;
     }
+
+    if (isYouTubeLink(cleanInput)) {
+      setError(
+        'That looks like a YouTube video link! Please enter your friend’s Unique Room Code (e.g. FFX-7K9M-4P2X) here. YouTube links are added inside the room’s video player.'
+      );
+      return;
+    }
+
     if (cleanName.length < 2 || cleanName.length > 40) {
       setError('Please enter a nickname between 2 and 40 characters.');
       return;
@@ -392,9 +593,17 @@ export const JoinRoomModal: React.FC<JoinRoomModalProps> = ({
 
     setLoading(true);
     try {
-      await onJoinRoom({ roomCodeOrLink: cleanInput, displayName: cleanName });
+      const result = await onJoinRoom({ roomCodeOrLink: cleanInput, displayName: cleanName });
+      if (result.status === 'pending_approval') {
+        setPendingRequest({
+          roomId: result.roomId,
+          roomName: result.roomName,
+          inviteCode: result.inviteCode,
+          message: result.message,
+        });
+      }
     } catch (err: any) {
-      setError(err?.message || 'Unable to join room. Verify the invite code and try again.');
+      setError(err?.message || 'Unable to join room. Verify the unique Room Code and try again.');
     } finally {
       setLoading(false);
     }
@@ -405,13 +614,20 @@ export const JoinRoomModal: React.FC<JoinRoomModalProps> = ({
       <div className="bg-[#12121E] border border-white/10 rounded-xl max-w-md w-full p-6 space-y-5 shadow-2xl">
         <div className="flex items-center justify-between border-b border-white/10 pb-4">
           <div>
-            <h2 className="text-lg font-display font-semibold text-white">Join a Watch Room</h2>
+            <h2 className="text-lg font-display font-semibold text-white">
+              {pendingRequest ? 'Join Request Sent' : 'Join a Watch Room'}
+            </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Enter your friend&apos;s invite code or paste the full watch party link.
+              {pendingRequest
+                ? 'Waiting for the room host to approve your request.'
+                : 'Public rooms join immediately. Private rooms send a join request to the host.'}
             </p>
           </div>
           <button
-            onClick={onClose}
+            onClick={() => {
+              setPendingRequest(null);
+              onClose();
+            }}
             className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 transition-colors cursor-pointer"
             aria-label="Close modal"
           >
@@ -419,63 +635,105 @@ export const JoinRoomModal: React.FC<JoinRoomModalProps> = ({
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {error && (
-            <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 flex items-center gap-2.5 text-xs text-rose-200">
-              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-              <span>{error}</span>
+        {pendingRequest ? (
+          <div className="space-y-4">
+            <div className="p-4 rounded-xl bg-[#09090F] border border-violet-500/40 flex flex-col items-center text-center space-y-3">
+              <div className="w-12 h-12 rounded-full bg-violet-600/20 border border-violet-500/40 flex items-center justify-center text-violet-300">
+                <Clock className="w-6 h-6 animate-pulse" />
+              </div>
+              <div className="space-y-1">
+                <div className="text-sm font-display font-semibold text-white">
+                  Waiting for Host Approval...
+                </div>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Your request to join <span className="text-white font-medium">{pendingRequest.roomName}</span> (
+                  <span className="font-mono text-violet-300">{pendingRequest.inviteCode}</span>) has been sent to the
+                  host. You will enter the room automatically as soon as the host clicks Approve.
+                </p>
+              </div>
             </div>
-          )}
 
-          <div className="space-y-1.5">
-            <label htmlFor="join-code-input" className="block text-xs font-medium text-slate-300">
-              Room Invite Code or Share Link
-            </label>
-            <input
-              id="join-code-input"
-              type="text"
-              required
-              value={roomCodeOrLink}
-              onChange={(e) => setRoomCodeOrLink(e.target.value)}
-              placeholder="e.g., K7M9-P4X2 or https://..."
-              className="w-full px-3.5 py-2 text-sm font-mono bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
-            />
+            <div className="flex items-center justify-between gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => setPendingRequest(null)}
+                className="w-full px-4 py-2 text-xs font-medium text-slate-300 hover:text-white bg-white/5 hover:bg-white/10 rounded-lg transition-colors cursor-pointer"
+              >
+                Cancel Request
+              </button>
+            </div>
           </div>
+        ) : (
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {error && (
+              <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 flex items-center gap-2.5 text-xs text-rose-200">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                <span>{error}</span>
+              </div>
+            )}
 
-          <div className="space-y-1.5">
-            <label htmlFor="join-nickname-input" className="block text-xs font-medium text-slate-300">
-              Your Display Name
-            </label>
-            <input
-              id="join-nickname-input"
-              type="text"
-              required
-              maxLength={40}
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="How friends will see you in chat & voice"
-              className="w-full px-3.5 py-2 text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
-            />
-          </div>
+            <div className="space-y-1.5">
+              <label htmlFor="join-code-input" className="block text-xs font-medium text-slate-300">
+                Unique Room Joining Code (or Share Link)
+              </label>
+              <input
+                id="join-code-input"
+                type="text"
+                required
+                value={roomCodeOrLink}
+                onChange={(e) => setRoomCodeOrLink(e.target.value)}
+                placeholder="e.g., FFX-7K9M-4P2X"
+                className="w-full px-3.5 py-2 text-sm font-mono bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500 uppercase"
+              />
+              <p className="text-[11px] text-slate-400">
+                Do not paste YouTube video links here. Enter only the Room Joining Code shared by the host.
+              </p>
+            </div>
 
-          <div className="pt-2 flex items-center justify-end gap-3">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-xs font-medium text-slate-300 hover:text-white bg-white/5 hover:bg-white/10 rounded-lg transition-colors cursor-pointer"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="inline-flex items-center gap-2 px-5 py-2 text-xs font-medium text-white bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
-            >
-              {loading && <Loader2 className="w-4 h-4 animate-spin" />}
-              <span>{loading ? 'Verifying Invite...' : 'Join Watch Room'}</span>
-            </button>
-          </div>
-        </form>
+            <div className="space-y-1.5">
+              <label htmlFor="join-nickname-input" className="block text-xs font-medium text-slate-300">
+                Your Display Name
+              </label>
+              <input
+                id="join-nickname-input"
+                type="text"
+                required
+                maxLength={40}
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                placeholder="How friends will see you in chat & voice"
+                className="w-full px-3.5 py-2 text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+              />
+            </div>
+
+            <div className="p-3 rounded-lg bg-[#09090F] border border-white/10 text-[11px] text-slate-400 space-y-1">
+              <div className="flex items-center gap-1.5 text-slate-300 font-medium">
+                <UserCheck className="w-3.5 h-3.5 text-violet-400" />
+                <span>How Room Joining Works:</span>
+              </div>
+              <div>· Public Room: Joins the watch party immediately.</div>
+              <div>· Private Room: Sends a join request to the host for instant approval.</div>
+            </div>
+
+            <div className="pt-2 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-4 py-2 text-xs font-medium text-slate-300 hover:text-white bg-white/5 hover:bg-white/10 rounded-lg transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={loading}
+                className="inline-flex items-center gap-2 px-5 py-2 text-xs font-medium text-white bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
+              >
+                {loading && <Loader2 className="w-4 h-4 animate-spin" />}
+                <span>{loading ? 'Checking Room Code...' : 'Join / Send Request'}</span>
+              </button>
+            </div>
+          </form>
+        )}
       </div>
     </div>
   );
@@ -528,7 +786,7 @@ export const AddMediaModal: React.FC<AddMediaModalProps> = ({
   const [uploadedBytes, setUploadedBytes] = useState(0);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
 
-  React.useEffect(() => {
+  useEffect(() => {
     setActiveTab(initialTab);
     setError(null);
   }, [initialTab, isOpen]);
@@ -545,9 +803,16 @@ export const AddMediaModal: React.FC<AddMediaModalProps> = ({
       return;
     }
 
+    if (ytInput.trim().toUpperCase().startsWith('FFX-')) {
+      setError('That is a Room Joining Code. Please paste a YouTube video link (e.g. https://www.youtube.com/watch?v=...).');
+      return;
+    }
+
     const parsedId = parseYouTubeVideoId(ytInput);
     if (!parsedId) {
-      setError('Invalid YouTube URL or video ID. Supported formats: youtube.com/watch?v=..., youtu.be/..., or 11-char ID.');
+      setError(
+        'Invalid YouTube URL or video ID. Supported formats: https://www.youtube.com/watch?v=..., https://youtu.be/..., or 11-char ID.'
+      );
       return;
     }
 
@@ -645,7 +910,7 @@ export const AddMediaModal: React.FC<AddMediaModalProps> = ({
           const resp = JSON.parse(xhr.responseText);
           setError(resp.error || `Upload failed with status ${xhr.status}.`);
         } catch {
-          setError(`Upload failed with status ${xhr.status}.`);
+          setError(`Upload failed with status ${xhr.status}. Note: Private file uploads require the Node/Express server runtime.`);
         }
       }
     };
@@ -678,7 +943,7 @@ export const AddMediaModal: React.FC<AddMediaModalProps> = ({
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
       <div className="bg-[#12121E] border border-white/10 rounded-xl max-w-lg w-full p-6 space-y-5 shadow-2xl">
         <div className="flex items-center justify-between border-b border-white/10 pb-4">
-          <h2 className="text-lg font-display font-semibold text-white">Select Media Source</h2>
+          <h2 className="text-lg font-display font-semibold text-white">Add Video to Watch Room</h2>
           <button
             onClick={() => {
               if (uploading) cancelFileUpload();
@@ -703,7 +968,7 @@ export const AddMediaModal: React.FC<AddMediaModalProps> = ({
             }`}
           >
             <Youtube className="w-4 h-4" />
-            <span>YouTube Video</span>
+            <span>YouTube Video Link</span>
           </button>
           <button
             type="button"
@@ -730,25 +995,27 @@ export const AddMediaModal: React.FC<AddMediaModalProps> = ({
         {activeTab === 'youtube' ? (
           <form onSubmit={handleYoutubeSubmit} className="space-y-4">
             <div className="space-y-1.5">
-              <label className="block text-xs font-medium text-slate-300">YouTube URL or Video ID</label>
+              <label className="block text-xs font-medium text-slate-300">
+                YouTube Video URL (Separate from Room Invite Code)
+              </label>
               <input
                 type="text"
                 required
                 value={ytInput}
                 onChange={(e) => setYtInput(e.target.value)}
-                placeholder="https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+                placeholder="https://www.youtube.com/watch?v=..."
                 className="w-full px-3.5 py-2 text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
               />
             </div>
 
             <div className="space-y-1.5">
-              <label className="block text-xs font-medium text-slate-300">Display Title</label>
+              <label className="block text-xs font-medium text-slate-300">Display Title (Optional)</label>
               <input
                 type="text"
                 maxLength={160}
                 value={ytTitle}
                 onChange={(e) => setYtTitle(e.target.value)}
-                placeholder="Optional custom title for the queue"
+                placeholder="Custom title for the shared queue"
                 className="w-full px-3.5 py-2 text-sm bg-[#09090F] border border-white/10 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
               />
             </div>
@@ -802,7 +1069,7 @@ export const AddMediaModal: React.FC<AddMediaModalProps> = ({
                 className="inline-flex items-center gap-2 px-5 py-2 text-xs font-medium text-white bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
               >
                 {ytLoading && <Loader2 className="w-4 h-4 animate-spin" />}
-                <span>{isHost && playImmediately ? 'Play Now & Queue' : 'Add to Shared Queue'}</span>
+                <span>{isHost && playImmediately ? 'Play Video Now' : 'Add to Shared Queue'}</span>
               </button>
             </div>
           </form>
@@ -1056,8 +1323,8 @@ export const InfoModal: React.FC<InfoModalProps> = ({ section, onClose, configSt
               expires due to inactivity, uploaded video files and room histories are automatically purged.
             </p>
             <p>
-              Peer-to-peer WebRTC voice audio is transmitted directly between participants in the same room after
-              explicit microphone activation and is never recorded or stored.
+              Peer-to-peer voice audio streams are transmitted directly between room participants via encrypted WebRTC
+              (DTLS-SRTP) and are never recorded or stored on our servers.
             </p>
           </div>
         )}
@@ -1065,17 +1332,17 @@ export const InfoModal: React.FC<InfoModalProps> = ({ section, onClose, configSt
         {section === 'terms' && (
           <div className="space-y-3 text-xs text-slate-300 leading-relaxed">
             <p>
-              1. <strong>Authorized Media Only:</strong> You may only upload MP4 or WebM video files that you own or are
-              authorized to share with your room participants.
+              By creating or joining a FriendsFlix watch room, you agree to stream only content that you have the legal
+              right to view and share with your invited friends.
             </p>
             <p>
-              2. <strong>YouTube Playback Compliance:</strong> Embedded YouTube videos are played through the official
-              YouTube IFrame Player API in compliance with YouTube Terms of Service. FriendsFlix never downloads,
-              scrapes, or bypasses platform restrictions.
+              YouTube playback uses the official YouTube IFrame Player API and abides by all YouTube terms, embed
+              permissions, and platform restrictions. FriendsFlix does not download, rip, or bypass DRM on third-party
+              videos.
             </p>
             <p>
-              3. <strong>Free-Tier Resource Boundaries:</strong> Free-tier limits (8 members per room, 4 active voice
-              peers, 50 MB per video upload) are enforced to maintain reliable service without paid subscriptions.
+              Room hosts are responsible for moderating their room participants, managing room lock settings, and
+              removing any inappropriate uploaded files.
             </p>
           </div>
         )}
@@ -1083,13 +1350,14 @@ export const InfoModal: React.FC<InfoModalProps> = ({ section, onClose, configSt
         {section === 'contact' && (
           <div className="space-y-3 text-xs text-slate-300 leading-relaxed">
             <p>
-              FriendsFlix is an open watch-party web application. Refer to the repository <span className="font-mono text-white">README.md</span> and{' '}
-              <span className="font-mono text-white">security_spec.md</span> for setup instructions, security rules
-              auditing, and deployment documentation.
+              FriendsFlix is an open-architecture watch party web application. For deployment configuration, Firebase
+              security rules verification, or operational limit tuning, refer to the repository documentation in{' '}
+              <span className="font-mono text-white">README.md</span> and{' '}
+              <span className="font-mono text-white">firestore.rules</span>.
             </p>
             <p className="text-slate-400">
-              No external support email or phone number is listed for this self-hosted preview instance. Use your
-              project issue tracker or deployment console to manage configuration.
+              No external support email or phone number is fabricated in this preview build. Configure your organization
+              support endpoint in your deployment environment variables if hosting publicly.
             </p>
           </div>
         )}

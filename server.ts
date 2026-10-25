@@ -93,6 +93,16 @@ export interface ChatMessageRecord {
   isSystem?: boolean;
 }
 
+export interface JoinRequestRecord {
+  memberId: string;
+  displayName: string;
+  avatarUrl: string;
+  authType: 'firebase' | 'guest';
+  status: 'pending' | 'approved' | 'rejected';
+  requestedAt: string;
+  updatedAt: string;
+}
+
 export interface RoomRecord {
   id: string;
   name: string;
@@ -113,6 +123,7 @@ export interface RoomRecord {
   createdAt: string;
   expiresAt: number;
   members: Record<string, RoomMemberRecord>;
+  joinRequests?: Record<string, JoinRequestRecord>;
   mediaItems: Record<string, MediaItemRecord>;
   queue: QueueItemRecord[];
   messages: ChatMessageRecord[];
@@ -147,6 +158,9 @@ function loadStateFromDisk() {
             m.isOnline = false;
             m.inVoice = false;
             m.isSpeaking = false;
+          }
+          if (!room.joinRequests) {
+            room.joinRequests = {};
           }
           rooms.set(room.id, room);
           inviteCodeToRoomId.set(room.inviteCode.toUpperCase(), room.id);
@@ -213,7 +227,7 @@ function generateInviteCode(): string {
   const bytes = crypto.randomBytes(8);
   for (let i = 0; i < 4; i++) part1 += chars[bytes[i] % chars.length];
   for (let i = 4; i < 8; i++) part2 += chars[bytes[i] % chars.length];
-  return `${part1}-${part2}`;
+  return `FFX-${part1}-${part2}`;
 }
 
 function sanitizeText(input: unknown, maxLen: number): string {
@@ -250,6 +264,7 @@ function serializeRoomForClient(room: RoomRecord) {
     createdAt: room.createdAt,
     expiresAt: room.expiresAt,
     members: Object.values(room.members),
+    joinRequests: Object.values(room.joinRequests || {}).filter((r) => r.status === 'pending'),
     mediaItems: Object.values(room.mediaItems).map((m) => ({
       id: m.id,
       ownerId: m.ownerId,
@@ -409,6 +424,7 @@ async function startServer() {
     const actor = req.actor!;
     const roomName = sanitizeText(req.body?.name, 80);
     const isPrivate = req.body?.isPrivate !== false; // True by default
+    const customInviteCode = sanitizeText(req.body?.customInviteCode, 16).toUpperCase();
     const initialYoutubeId = sanitizeText(req.body?.initialYoutubeId, 32);
     const initialYoutubeTitle = sanitizeText(req.body?.initialYoutubeTitle, 160);
 
@@ -418,7 +434,10 @@ async function startServer() {
     }
 
     const roomId = `rm_${crypto.randomBytes(8).toString('hex')}`;
-    let inviteCode = generateInviteCode();
+    let inviteCode =
+      customInviteCode && /^[A-Z0-9\-]{6,16}$/.test(customInviteCode) && !inviteCodeToRoomId.has(customInviteCode)
+        ? customInviteCode
+        : generateInviteCode();
     while (inviteCodeToRoomId.has(inviteCode)) {
       inviteCode = generateInviteCode();
     }
@@ -465,6 +484,7 @@ async function startServer() {
           isSpeaking: false,
         },
       },
+      joinRequests: {},
       mediaItems: {},
       queue: [],
       messages: [
@@ -474,7 +494,9 @@ async function startServer() {
           senderId: 'system',
           displayName: 'FriendsFlix',
           avatarUrl: '',
-          message: `${actor.displayName} created "${roomName}". Share the invite code ${inviteCode} to watch together.`,
+          message: `${actor.displayName} created "${roomName}". Unique Room Code: ${inviteCode} (${
+            isPrivate ? 'Private Room — Join by Request' : 'Public Room — Direct Join'
+          }).`,
           reactions: {},
           createdAt: nowIso,
           isSystem: true,
@@ -516,7 +538,7 @@ async function startServer() {
     res.status(201).json({ room: serializeRoomForClient(room) });
   });
 
-  // 4. Join Room via Invite Code or Room ID + Invite Credential
+  // 4. Join Room via Unique Invite Code (Public = Direct Join, Private = Send Join Request to Host)
   app.post('/api/rooms/join', requireActor, (req: AuthenticatedRequest, res: Response) => {
     const actor = req.actor!;
     const rawCodeOrInput = sanitizeText(req.body?.inviteCode || req.body?.roomCodeOrLink, 250);
@@ -524,6 +546,15 @@ async function startServer() {
 
     if (!rawCodeOrInput && !explicitRoomId) {
       res.status(400).json({ error: 'Please provide a valid room code or invite link.' });
+      return;
+    }
+
+    const lowerRaw = rawCodeOrInput.toLowerCase();
+    if (lowerRaw.includes('youtube.com/') || lowerRaw.includes('youtu.be/')) {
+      res.status(400).json({
+        error:
+          'That is a YouTube video link! Please enter your friend’s Unique Room Joining Code (e.g. FFX-7K9M-4P2X) here. You can paste YouTube links inside the room’s video player.',
+      });
       return;
     }
 
@@ -556,7 +587,7 @@ async function startServer() {
     }
 
     if (!targetRoom) {
-      res.status(404).json({ error: 'Room not found. Check your invite code or ask the host for a fresh link.' });
+      res.status(404).json({ error: 'Room not found. Check the unique Room Code or ask the host for a fresh code.' });
       return;
     }
 
@@ -565,20 +596,14 @@ async function startServer() {
       return;
     }
 
-    const isExistingMember = Boolean(targetRoom.members[actor.id]);
-
-    // Enforce Private Room Authorization
-    if (targetRoom.isPrivate && !isExistingMember) {
-      if (!parsedInviteCode || parsedInviteCode !== targetRoom.inviteCode.toUpperCase()) {
-        res.status(403).json({
-          error: 'This room is private. A valid invitation code or invite link is required to join.',
-        });
-        return;
-      }
+    if (!targetRoom.joinRequests) {
+      targetRoom.joinRequests = {};
     }
 
+    const isExistingMember = Boolean(targetRoom.members[actor.id]) || targetRoom.hostId === actor.id;
+
     // Enforce Locked Room Check
-    if (targetRoom.isLocked && !isExistingMember && targetRoom.hostId !== actor.id) {
+    if (targetRoom.isLocked && !isExistingMember) {
       res.status(423).json({ error: 'This room is currently locked by the host and not accepting new members.' });
       return;
     }
@@ -595,13 +620,152 @@ async function startServer() {
     const nowIso = new Date().toISOString();
     targetRoom.expiresAt = Date.now() + LIMITS.IDLE_ROOM_EXPIRY_MS;
 
-    if (!isExistingMember) {
-      targetRoom.members[actor.id] = {
+    // If user is already an active member or host, let them right back in
+    if (isExistingMember) {
+      if (targetRoom.members[actor.id]) {
+        targetRoom.members[actor.id].displayName = actor.displayName;
+        targetRoom.members[actor.id].lastSeenAt = nowIso;
+        targetRoom.members[actor.id].isOnline = true;
+      }
+      saveStateToDisk();
+      broadcastToRoom(targetRoom.id, {
+        type: 'presence:sync',
+        members: Object.values(targetRoom.members),
+      });
+      res.json({ status: 'joined', room: serializeRoomForClient(targetRoom) });
+      return;
+    }
+
+    // PRIVATE ROOM: Require valid invite code AND send a Join Request to the Host for approval
+    if (targetRoom.isPrivate) {
+      if (!parsedInviteCode || parsedInviteCode !== targetRoom.inviteCode.toUpperCase()) {
+        res.status(403).json({
+          error: 'This room is private. Please enter the room’s unique invite code to send a join request.',
+        });
+        return;
+      }
+
+      const existingRequest = targetRoom.joinRequests[actor.id];
+      if (existingRequest && existingRequest.status === 'approved') {
+        targetRoom.members[actor.id] = {
+          memberId: actor.id,
+          displayName: actor.displayName,
+          avatarUrl: actor.avatarUrl,
+          authType: actor.authType,
+          role: actor.authType === 'guest' ? 'guest' : 'participant',
+          joinedAt: nowIso,
+          lastSeenAt: nowIso,
+          isOnline: true,
+          inVoice: false,
+          isMuted: false,
+          isSpeaking: false,
+        };
+        delete targetRoom.joinRequests[actor.id];
+        saveStateToDisk();
+        broadcastToRoom(targetRoom.id, {
+          type: 'member:joined',
+          member: targetRoom.members[actor.id],
+          members: Object.values(targetRoom.members),
+          joinRequests: Object.values(targetRoom.joinRequests).filter((r) => r.status === 'pending'),
+        });
+        res.json({ status: 'joined', room: serializeRoomForClient(targetRoom) });
+        return;
+      }
+
+      targetRoom.joinRequests[actor.id] = {
         memberId: actor.id,
         displayName: actor.displayName,
         avatarUrl: actor.avatarUrl,
         authType: actor.authType,
-        role: targetRoom.hostId === actor.id ? 'host' : actor.authType === 'guest' ? 'guest' : 'participant',
+        status: 'pending',
+        requestedAt: existingRequest?.requestedAt || nowIso,
+        updatedAt: nowIso,
+      };
+
+      saveStateToDisk();
+      broadcastToRoom(targetRoom.id, {
+        type: 'room:join_requests_updated',
+        joinRequests: Object.values(targetRoom.joinRequests).filter((r) => r.status === 'pending'),
+        requesterName: actor.displayName,
+      });
+
+      res.status(202).json({
+        status: 'pending_approval',
+        roomId: targetRoom.id,
+        roomName: targetRoom.name,
+        inviteCode: targetRoom.inviteCode,
+        message: 'Join request sent to the room host! Waiting for host approval...',
+      });
+      return;
+    }
+
+    // PUBLIC ROOM: Join directly without waiting for host approval!
+    targetRoom.members[actor.id] = {
+      memberId: actor.id,
+      displayName: actor.displayName,
+      avatarUrl: actor.avatarUrl,
+      authType: actor.authType,
+      role: actor.authType === 'guest' ? 'guest' : 'participant',
+      joinedAt: nowIso,
+      lastSeenAt: nowIso,
+      isOnline: true,
+      inVoice: false,
+      isMuted: false,
+      isSpeaking: false,
+    };
+
+    const joinMsg: ChatMessageRecord = {
+      id: `msg_${crypto.randomBytes(6).toString('hex')}`,
+      roomId: targetRoom.id,
+      senderId: 'system',
+      displayName: 'FriendsFlix',
+      avatarUrl: '',
+      message: `${actor.displayName} joined the room directly via code ${targetRoom.inviteCode}.`,
+      reactions: {},
+      createdAt: nowIso,
+      isSystem: true,
+    };
+    targetRoom.messages.push(joinMsg);
+    saveStateToDisk();
+
+    broadcastToRoom(targetRoom.id, {
+      type: 'member:joined',
+      member: targetRoom.members[actor.id],
+      members: Object.values(targetRoom.members),
+      systemMessage: joinMsg,
+    });
+
+    res.json({ status: 'joined', room: serializeRoomForClient(targetRoom) });
+  });
+
+  // 4b. Poll Private Room Join Request Status
+  app.get('/api/rooms/:roomId/join-status', requireActor, (req: AuthenticatedRequest, res: Response) => {
+    const actor = req.actor!;
+    const room = rooms.get(req.params.roomId);
+    if (!room || room.status === 'ended') {
+      res.status(404).json({ status: 'rejected', error: 'Room was ended or no longer exists.' });
+      return;
+    }
+
+    if (room.members[actor.id] || room.hostId === actor.id) {
+      res.json({ status: 'approved', room: serializeRoomForClient(room) });
+      return;
+    }
+
+    const reqRecord = room.joinRequests?.[actor.id];
+    if (!reqRecord) {
+      res.json({ status: 'pending' });
+      return;
+    }
+
+    if (reqRecord.status === 'approved') {
+      const nowIso = new Date().toISOString();
+      room.members[actor.id] = {
+        memberId: actor.id,
+        displayName: actor.displayName,
+        avatarUrl: actor.avatarUrl,
+        authType: actor.authType,
+        role: actor.authType === 'guest' ? 'guest' : 'participant',
         joinedAt: nowIso,
         lastSeenAt: nowIso,
         isOnline: true,
@@ -609,38 +773,115 @@ async function startServer() {
         isMuted: false,
         isSpeaking: false,
       };
-
-      const joinMsg: ChatMessageRecord = {
-        id: `msg_${crypto.randomBytes(6).toString('hex')}`,
-        roomId: targetRoom.id,
-        senderId: 'system',
-        displayName: 'FriendsFlix',
-        avatarUrl: '',
-        message: `${actor.displayName} joined the room.`,
-        reactions: {},
-        createdAt: nowIso,
-        isSystem: true,
-      };
-      targetRoom.messages.push(joinMsg);
-      broadcastToRoom(targetRoom.id, {
+      delete room.joinRequests![actor.id];
+      saveStateToDisk();
+      broadcastToRoom(room.id, {
         type: 'member:joined',
-        member: targetRoom.members[actor.id],
-        members: Object.values(targetRoom.members),
-        systemMessage: joinMsg,
+        member: room.members[actor.id],
+        members: Object.values(room.members),
+        joinRequests: Object.values(room.joinRequests || {}).filter((r) => r.status === 'pending'),
       });
-    } else {
-      targetRoom.members[actor.id].displayName = actor.displayName;
-      targetRoom.members[actor.id].lastSeenAt = nowIso;
-      targetRoom.members[actor.id].isOnline = true;
-      broadcastToRoom(targetRoom.id, {
-        type: 'presence:sync',
-        members: Object.values(targetRoom.members),
-      });
+      res.json({ status: 'approved', room: serializeRoomForClient(room) });
+      return;
     }
 
-    saveStateToDisk();
-    res.json({ room: serializeRoomForClient(targetRoom) });
+    if (reqRecord.status === 'rejected') {
+      res.json({ status: 'rejected', error: 'Your join request was declined by the room host.' });
+      return;
+    }
+
+    res.json({ status: 'pending' });
   });
+
+  // 4c. Host Approve or Reject Private Room Join Request
+  app.post(
+    '/api/rooms/:roomId/join-requests/:targetMemberId/respond',
+    requireActor,
+    (req: AuthenticatedRequest, res: Response) => {
+      const actor = req.actor!;
+      const room = rooms.get(req.params.roomId);
+      const targetMemberId = sanitizeText(req.params.targetMemberId, 128);
+      const action = req.body?.action === 'reject' ? 'reject' : 'approve';
+
+      if (!room || room.status === 'ended') {
+        res.status(404).json({ error: 'Active room not found.' });
+        return;
+      }
+      if (room.hostId !== actor.id) {
+        res.status(403).json({ error: 'Only the room host can approve or decline join requests.' });
+        return;
+      }
+      if (!room.joinRequests) {
+        room.joinRequests = {};
+      }
+
+      const targetReq = room.joinRequests[targetMemberId];
+      if (!targetReq) {
+        res.status(404).json({ error: 'Join request not found or already handled.' });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+
+      if (action === 'approve') {
+        if (Object.keys(room.members).length >= LIMITS.MAX_ROOM_PARTICIPANTS) {
+          res.status(429).json({ error: `Room is full (max ${LIMITS.MAX_ROOM_PARTICIPANTS} participants).` });
+          return;
+        }
+
+        targetReq.status = 'approved';
+        targetReq.updatedAt = nowIso;
+
+        room.members[targetMemberId] = {
+          memberId: targetReq.memberId,
+          displayName: targetReq.displayName,
+          avatarUrl: targetReq.avatarUrl,
+          authType: targetReq.authType,
+          role: targetReq.authType === 'guest' ? 'guest' : 'participant',
+          joinedAt: nowIso,
+          lastSeenAt: nowIso,
+          isOnline: true,
+          inVoice: false,
+          isMuted: false,
+          isSpeaking: false,
+        };
+        delete room.joinRequests[targetMemberId];
+
+        const approveMsg: ChatMessageRecord = {
+          id: `msg_${crypto.randomBytes(6).toString('hex')}`,
+          roomId: room.id,
+          senderId: 'system',
+          displayName: 'FriendsFlix',
+          avatarUrl: '',
+          message: `${targetReq.displayName}'s join request was approved by the host.`,
+          reactions: {},
+          createdAt: nowIso,
+          isSystem: true,
+        };
+        room.messages.push(approveMsg);
+        saveStateToDisk();
+
+        broadcastToRoom(room.id, {
+          type: 'member:joined',
+          member: room.members[targetMemberId],
+          members: Object.values(room.members),
+          joinRequests: Object.values(room.joinRequests).filter((r) => r.status === 'pending'),
+          systemMessage: approveMsg,
+        });
+      } else {
+        targetReq.status = 'rejected';
+        targetReq.updatedAt = nowIso;
+        saveStateToDisk();
+
+        broadcastToRoom(room.id, {
+          type: 'room:join_requests_updated',
+          joinRequests: Object.values(room.joinRequests).filter((r) => r.status === 'pending'),
+        });
+      }
+
+      res.json({ room: serializeRoomForClient(room) });
+    }
+  );
 
   // 5. Get Authorized Room State
   app.get('/api/rooms/:roomId', requireActor, (req: AuthenticatedRequest, res: Response) => {
